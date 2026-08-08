@@ -1,8 +1,8 @@
 #ifndef duckdb_fdw_H
 #define duckdb_fdw_H
 
-#include "duckdb.h"
 #include "postgres.h"
+#include "duckdb.h"
 #include "nanoarrow/nanoarrow.h"
 #include "funcapi.h"
 #include "fmgr.h"

@@ -26,6 +26,11 @@
 #include "miscadmin.h"
 #include "executor/executor.h"
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= 180000
+/* PG18 split ExplainState / ExplainProperty* out of explain.h */
+#include "commands/explain_state.h"
+#include "commands/explain_format.h"
+#endif
 #include "nodes/nodeFuncs.h"
 
 PG_MODULE_MAGIC;
@@ -472,13 +477,20 @@ duckdbGetForeignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
                  create_foreignscan_path(root, joinrel,
                                           joinrel->reltarget,
                                           rows,
+#if PG_VERSION_NUM >= 180000
+                                          0, /* disabled_nodes */
+#endif
                                           startup_cost,
                                           total_cost,
                                           NIL,
                                           joinrel->lateral_relids,
                                           NULL,
+#if PG_VERSION_NUM >= 170000
                                           NIL,
                                           NIL));
+#else
+                                          NIL));
+#endif
     }
 }
 
@@ -568,13 +580,20 @@ duckdbGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
              create_foreignscan_path(root, baserel,
                                      baserel->reltarget,
                                      rows,
+#if PG_VERSION_NUM >= 180000
+                                     0,     /* disabled_nodes */
+#endif
                                      startup_cost,
                                      total_cost,
                                      NIL,   /* no pathkeys */
                                      NULL,  /* no required_outer */
                                      NULL,  /* no fdw_outerpath */
+#if PG_VERSION_NUM >= 170000
                                      NIL,   /* no fdw_restrictinfo */
                                      NIL)); /* no fdw_private */
+#else
+                                     NIL)); /* no fdw_private */
+#endif
 }
 
 static ForeignScan *
@@ -898,13 +917,20 @@ duckdbGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
                  create_foreignscan_path(root, output_rel,
                                           output_rel->reltarget,
                                           rows,
+#if PG_VERSION_NUM >= 180000
+                                          0, /* disabled_nodes */
+#endif
                                           startup_cost,
                                           total_cost,
                                           NIL,
                                           NULL,
                                           NULL,
+#if PG_VERSION_NUM >= 170000
                                           NIL,
                                           NIL));
+#else
+                                          NIL));
+#endif
     }
 }
 

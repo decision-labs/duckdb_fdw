@@ -115,7 +115,13 @@ duckdb_runtime_guard_status(void)
 #ifdef __linux__
 	return duckdb_runtime_guard_status_linux();
 #else
-	return DUCKDB_RUNTIME_COMPATIBLE_UNPROVEN;
+	/*
+	 * Peer-module scanning is Linux-only today. On other platforms we cannot
+	 * detect a loaded pg_duckdb peer, so treat the backend as having no peer
+	 * rather than COMPATIBLE_UNPROVEN (which is a hard error under the
+	 * strict coexistence policy and breaks macOS CI).
+	 */
+	return DUCKDB_RUNTIME_NO_PEER_LOADED;
 #endif
 }
 

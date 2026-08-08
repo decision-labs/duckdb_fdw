@@ -1,6 +1,7 @@
 #!/bin/bash
+set -euo pipefail
 
-DEFAULT_DUCKDB_VERSION="1.5.1"
+DEFAULT_DUCKDB_VERSION="1.5.5"
 
 normalize_version_tag() {
     case "$1" in
@@ -9,15 +10,13 @@ normalize_version_tag() {
     esac
 }
 
-# Function to get system info
 get_system_info() {
     OS=$(uname -s)
     ARCH=$(uname -m)
-    
+
     case "$OS" in
         "Darwin")
             PLATFORM="osx"
-            # For macOS, we'll use universal build
             ARCH="universal"
             LIB_EXT="dylib"
             ;;
@@ -27,8 +26,10 @@ get_system_info() {
                 "x86_64")
                     ARCH="amd64"
                     ;;
+                # DuckDB liberleases used "aarch64" through v1.2.x and
+                # "arm64" from v1.3.0 onward. Prefer arm64 for current pins.
                 "aarch64"|"arm64")
-                    ARCH="aarch64"
+                    ARCH="arm64"
                     ;;
             esac
             LIB_EXT="so"
@@ -39,29 +40,51 @@ get_system_info() {
             LIB_EXT="dll"
             ;;
         *)
-            echo "Unsupported operating system: $OS"
+            echo "Unsupported operating system: $OS" >&2
             exit 1
             ;;
     esac
 }
 
-# Get system information
 get_system_info
 
-# Resolve requested version
 REQUESTED_VERSION=${DUCKDB_VERSION:-$DEFAULT_DUCKDB_VERSION}
 VERSION=$(normalize_version_tag "$REQUESTED_VERSION")
 
+try_download() {
+    local url="$1"
+    echo "Downloading DuckDB ${VERSION} for ${PLATFORM}-${ARCH}..."
+    echo "URL: ${url}"
+    if ! curl -fsSL -o duckdb-temp.zip "${url}"; then
+        rm -f duckdb-temp.zip
+        return 1
+    fi
+    unzip -o duckdb-temp.zip
+    rm -f duckdb-temp.zip
+    return 0
+}
 
-
-# Construct download URL
 DOWNLOAD_URL="https://github.com/duckdb/duckdb/releases/download/${VERSION}/libduckdb-${PLATFORM}-${ARCH}.zip"
 
-echo "Downloading DuckDB ${VERSION} for ${PLATFORM}-${ARCH}..."
-echo "URL: ${DOWNLOAD_URL}"
+if ! try_download "${DOWNLOAD_URL}"; then
+    if [ "${PLATFORM}" = "linux" ] && [ "${ARCH}" = "arm64" ]; then
+        ARCH="aarch64"
+        FALLBACK_URL="https://github.com/duckdb/duckdb/releases/download/${VERSION}/libduckdb-${PLATFORM}-${ARCH}.zip"
+        echo "Primary URL failed; retrying with legacy arch name aarch64..."
+        if ! try_download "${FALLBACK_URL}"; then
+            echo "Failed to download libduckdb for linux arm (tried arm64 and aarch64)" >&2
+            exit 1
+        fi
+    else
+        echo "Failed to download libduckdb from ${DOWNLOAD_URL}" >&2
+        exit 1
+    fi
+fi
 
-# Download and extract
-curl -L -o duckdb-temp.zip "${DOWNLOAD_URL}"
-unzip -o duckdb-temp.zip
+if [ ! -f duckdb.h ]; then
+    echo "download_libduckdb.sh: duckdb.h missing after extract" >&2
+    ls -la >&2 || true
+    exit 1
+fi
 
-rm duckdb-temp.zip
+echo "DuckDB ${VERSION} ready (libduckdb.${LIB_EXT}, duckdb.h present)."

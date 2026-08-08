@@ -54,7 +54,7 @@ scripts/verify_pg_env.sh --pg-major 17
 ./download_libduckdb.sh
 
 # Or pin a specific DuckDB release explicitly
-DUCKDB_VERSION=1.5.1 ./download_libduckdb.sh
+DUCKDB_VERSION=1.5.5 ./download_libduckdb.sh
 
 # 2. Build and Install (USE_PGXS is auto-detected)
 make
@@ -63,7 +63,7 @@ sudo make install
 
 ### Requirements
 * PostgreSQL 13 - 18 (headers required)
-* DuckDB library (`libduckdb.so` or `libduckdb.dylib`) with repo-pinned bootstrap default `1.5.1`
+* DuckDB library (`libduckdb.so` or `libduckdb.dylib`) with repo-pinned bootstrap default `1.5.5`
 * GCC or Clang with C11/C++11 support
 
 ## 🛠️ Usage
