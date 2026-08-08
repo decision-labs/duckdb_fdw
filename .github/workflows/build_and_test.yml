@@ -36,22 +36,63 @@ jobs:
     - name: Install Dependencies (Linux)
       if: runner.os == 'Linux'
       run: |
-        # Add PG Repo
+        set -euo pipefail
+        PG_MAJOR="${{ matrix.pg_version }}"
+        PG_BIN="/usr/lib/postgresql/${PG_MAJOR}/bin"
+
+        # Add PGDG repo
         sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
         wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
         sudo apt-get update
-        sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }} curl unzip build-essential
-        
-        # Start Service
-        sudo service postgresql start
-        # Wait for service
-        while ! pg_isready; do sleep 1; done
-        
-        # Configure User / default database
-        sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
-        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = 'postgres'" | grep -q 1           || sudo -u postgres createdb -O postgres postgres
+        sudo apt-get install -y postgresql-${PG_MAJOR} postgresql-client-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR} curl unzip build-essential
+
+        # Prefer the matrix major for pg_config/psql/pg_isready
+        echo "${PG_BIN}" >> "$GITHUB_PATH"
+        export PATH="${PG_BIN}:$PATH"
+
+        # Stop non-matrix clusters so port 5432 is unambiguous
+        if command -v pg_lsclusters >/dev/null 2>&1; then
+          while read -r ver name port status rest; do
+            case "$ver" in
+              Ver|"") continue ;;
+            esac
+            if [ "$ver" != "$PG_MAJOR" ]; then
+              sudo pg_ctlcluster "$ver" "$name" stop || true
+            fi
+          done < <(pg_lsclusters)
+        fi
+
+        # Ensure the matrix cluster exists and listens on 5432 with password auth
+        if ! pg_lsclusters | awk -v v="$PG_MAJOR" '$1 == v && $2 == "main" { found=1 } END { exit !found }'; then
+          sudo pg_createcluster "$PG_MAJOR" main --port=5432
+        fi
+        CONF="/etc/postgresql/${PG_MAJOR}/main/postgresql.conf"
+        HBA="/etc/postgresql/${PG_MAJOR}/main/pg_hba.conf"
+        sudo sed -i "s/^#\?port\s*=.*/port = 5432/" "$CONF"
+        if ! sudo grep -qE '^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+127\.0\.0\.1/32[[:space:]]+md5' "$HBA"; then
+          echo 'host all all 127.0.0.1/32 md5' | sudo tee -a "$HBA" >/dev/null
+        fi
+        if ! sudo grep -qE '^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+::1/128[[:space:]]+md5' "$HBA"; then
+          echo 'host all all ::1/128 md5' | sudo tee -a "$HBA" >/dev/null
+        fi
+        sudo pg_ctlcluster "$PG_MAJOR" main restart || sudo pg_ctlcluster "$PG_MAJOR" main start
+
+        for i in $(seq 1 30); do
+          pg_isready -h localhost -p 5432 && break
+          sleep 1
+        done
+        pg_isready -h localhost -p 5432
+
+        sudo -u postgres "${PG_BIN}/psql" -c "ALTER USER postgres PASSWORD 'postgres';"
+        sudo -u postgres "${PG_BIN}/psql" -tc "SELECT 1 FROM pg_database WHERE datname = 'postgres'" | grep -q 1 \
+          || sudo -u postgres "${PG_BIN}/createdb" -O postgres postgres
+
+        echo "Active clusters:"
+        pg_lsclusters
+        echo "pg_config: $(command -v pg_config) ($(pg_config --version))"
 
     # --- macOS Setup ---
+
     - name: Install Dependencies (macOS)
       if: runner.os == 'macOS'
       run: |
@@ -96,9 +137,14 @@ jobs:
            echo "Skipping build on Windows due to complexity of PGXS env setup."
            exit 0
         fi
-        
+
+        if [ "$RUNNER_OS" == "Linux" ]; then
+          export PATH="/usr/lib/postgresql/${{ matrix.pg_version }}/bin:$PATH"
+        fi
+        echo "Building against: $(pg_config --version) ($(command -v pg_config))"
+
         make USE_PGXS=1
-        sudo make USE_PGXS=1 install || make USE_PGXS=1 install
+        sudo env "PATH=$PATH" make USE_PGXS=1 install || make USE_PGXS=1 install
 
     - name: Run Tests
       shell: bash
@@ -126,9 +172,12 @@ jobs:
 
         # Ensure the target database exists (Linux apt packages usually ship "postgres")
         if [ "$RUNNER_OS" == "Linux" ]; then
+           export PATH="/usr/lib/postgresql/${{ matrix.pg_version }}/bin:$PATH"
            export PGDATABASE="${PGDATABASE:-postgres}"
-           PGPASSWORD="${PGPASSWORD:-postgres}" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tc "SELECT 1" >/dev/null
-           PGPASSWORD="${PGPASSWORD:-postgres}" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${PGDATABASE}'" | grep -q 1              || PGPASSWORD="${PGPASSWORD:-postgres}" createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$PGDATABASE"
+           echo "Testing against: $(psql --version) / $(pg_config --version)"
+           PGPASSWORD="${PGPASSWORD:-postgres}" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tc "SELECT version();"
+           PGPASSWORD="${PGPASSWORD:-postgres}" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${PGDATABASE}'" | grep -q 1 \
+             || PGPASSWORD="${PGPASSWORD:-postgres}" createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$PGDATABASE"
         fi
         
         if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then

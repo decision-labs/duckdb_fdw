@@ -193,15 +193,34 @@ for f in "${TEST_FILES[@]}"; do
         SED_EXPR="$SED_EXPR; s@YOUR_ACCESS_KEY@$S3_ACCESS_KEY@g; s@YOUR_SECRET_KEY@$S3_SECRET_KEY@g"
     fi
 
-    # 2. 直接通过管道运行，不再产生临时文件
-    # 使用 -f - 让 psql 从标准输入读取
+    # 2. Pipe SQL into psql. After each CREATE SERVER, ensure a USER MAPPING
+    # exists for the current role (examples often omit this, but GetUserMapping
+    # requires a mapping even when there are no mapping options).
     CMD_BASE="$PSQL_BIN -v ON_ERROR_STOP=1 -p $PGPORT -h $PGHOST -d $PGDATABASE -U $PGUSER -f -"
 
+    prepare_sql() {
+        sed "$SED_EXPR" "$f" | python3 -c '
+import re, sys
+pat = re.compile(
+    r"^(?P<prefix>\s*CREATE(?:\s+OR\s+REPLACE)?\s+SERVER\s+)(?P<name>\"?[A-Za-z_][A-Za-z0-9_]*\"?)(?P<rest>\b.*)$",
+    re.IGNORECASE,
+)
+for line in sys.stdin:
+    sys.stdout.write(line)
+    m = pat.match(line.rstrip("\n"))
+    if m:
+        name = m.group("name")
+        sys.stdout.write(
+            f"CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER SERVER {name};\n"
+        )
+'
+    }
+
     if [ "$VERBOSE" = true ]; then
-        sed "$SED_EXPR" "$f" | $CMD_BASE
+        prepare_sql | $CMD_BASE
         RET=$?
     else
-        ERROR_MSG=$(sed "$SED_EXPR" "$f" | $CMD_BASE 2>&1 > /dev/null)
+        ERROR_MSG=$(prepare_sql | $CMD_BASE 2>&1 > /dev/null)
         RET=$?
     fi
     
