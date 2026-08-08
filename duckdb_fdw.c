@@ -472,6 +472,9 @@ duckdbGetForeignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
                  create_foreignscan_path(root, joinrel,
                                           joinrel->reltarget,
                                           rows,
+#if PG_VERSION_NUM >= 180000
+                                          0, /* disabled_nodes */
+#endif
                                           startup_cost,
                                           total_cost,
                                           NIL,
@@ -572,6 +575,9 @@ duckdbGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
              create_foreignscan_path(root, baserel,
                                      baserel->reltarget,
                                      rows,
+#if PG_VERSION_NUM >= 180000
+                                     0,     /* disabled_nodes */
+#endif
                                      startup_cost,
                                      total_cost,
                                      NIL,   /* no pathkeys */
@@ -906,6 +912,9 @@ duckdbGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
                  create_foreignscan_path(root, output_rel,
                                           output_rel->reltarget,
                                           rows,
+#if PG_VERSION_NUM >= 180000
+                                          0, /* disabled_nodes */
+#endif
                                           startup_cost,
                                           total_cost,
                                           NIL,
