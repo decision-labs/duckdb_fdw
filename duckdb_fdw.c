@@ -480,7 +480,7 @@ duckdbGetForeignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
                                           NIL,
                                           joinrel->lateral_relids,
                                           NULL,
-#if PG_VERSION_NUM >= 160000
+#if PG_VERSION_NUM >= 170000
                                           NIL,
                                           NIL));
 #else
@@ -583,11 +583,11 @@ duckdbGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
                                      NIL,   /* no pathkeys */
                                      NULL,  /* no required_outer */
                                      NULL,  /* no fdw_outerpath */
-#if PG_VERSION_NUM >= 160000
+#if PG_VERSION_NUM >= 170000
                                      NIL,   /* no fdw_restrictinfo */
                                      NIL)); /* no fdw_private */
 #else
-                                     NIL)); /* no fdw_restrictinfo */
+                                     NIL)); /* no fdw_private */
 #endif
 }
 
@@ -920,7 +920,7 @@ duckdbGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
                                           NIL,
                                           NULL,
                                           NULL,
-#if PG_VERSION_NUM >= 160000
+#if PG_VERSION_NUM >= 170000
                                           NIL,
                                           NIL));
 #else
