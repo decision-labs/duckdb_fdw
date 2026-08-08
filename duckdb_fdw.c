@@ -477,8 +477,12 @@ duckdbGetForeignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
                                           NIL,
                                           joinrel->lateral_relids,
                                           NULL,
+#if PG_VERSION_NUM >= 160000
                                           NIL,
                                           NIL));
+#else
+                                          NIL));
+#endif
     }
 }
 
@@ -573,8 +577,12 @@ duckdbGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
                                      NIL,   /* no pathkeys */
                                      NULL,  /* no required_outer */
                                      NULL,  /* no fdw_outerpath */
+#if PG_VERSION_NUM >= 160000
                                      NIL,   /* no fdw_restrictinfo */
                                      NIL)); /* no fdw_private */
+#else
+                                     NIL)); /* no fdw_restrictinfo */
+#endif
 }
 
 static ForeignScan *
@@ -903,8 +911,12 @@ duckdbGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
                                           NIL,
                                           NULL,
                                           NULL,
+#if PG_VERSION_NUM >= 160000
                                           NIL,
                                           NIL));
+#else
+                                          NIL));
+#endif
     }
 }
 
