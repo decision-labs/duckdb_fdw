@@ -26,6 +26,11 @@
 #include "miscadmin.h"
 #include "executor/executor.h"
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= 180000
+/* PG18 split ExplainState / ExplainProperty* out of explain.h */
+#include "commands/explain_state.h"
+#include "commands/explain_format.h"
+#endif
 #include "nodes/nodeFuncs.h"
 
 PG_MODULE_MAGIC;

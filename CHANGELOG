@@ -5,6 +5,7 @@
 - Gate create_foreignscan_path arity for PG15–16 / PG17 (fdw_restrictinfo) / PG18 (disabled_nodes).
 - Fix Linux ARM libduckdb asset arch (arm64; aarch64 fallback for older releases).
 - Include postgres.h before duckdb.h in duckdb_fdw.h.
+- PG18: include explain_state.h / explain_format.h for ExplainState.
 - Restricted admin-like helper execution by default and aligned public capability claims with the code-backed chunk-result read path.
 - Added transaction-scoped connection cache cleanup and routed foreign path creation through a shared costing helper.
 - Added contributor onboarding guidance and deterministic DuckDB bootstrap defaults.
