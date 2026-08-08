@@ -1,6 +1,6 @@
 #!/bin/bash
 
-DEFAULT_DUCKDB_VERSION="1.5.1"
+DEFAULT_DUCKDB_VERSION="1.5.5"
 
 normalize_version_tag() {
     case "$1" in

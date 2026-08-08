@@ -18,7 +18,7 @@ Use the repository bootstrap script to download the default pinned DuckDB librar
 To test another DuckDB release explicitly:
 
 ```bash
-DUCKDB_VERSION=1.4.4 ./download_libduckdb.sh
+DUCKDB_VERSION=1.5.5 ./download_libduckdb.sh
 ```
 
 For PostgreSQL development prerequisites on Debian/Ubuntu or WSL-style environments:

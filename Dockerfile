@@ -1,6 +1,7 @@
 # 第一阶段：编译构建
 ARG POSTGRES_VERSION=17
 FROM postgres:${POSTGRES_VERSION} AS builder
+ARG POSTGRES_VERSION=17
 
 LABEL maintainer="duckdb_fdw team"
 
@@ -12,14 +13,14 @@ RUN apt-get update && apt-get install -y \
     unzip \
     wget \
     git \
-    libstdc++-12-dev
+    g++
 
 WORKDIR /build
 
 # 复制源码
 COPY . .
 
-# 下载 DuckDB 原生内核 (v1.4.3+)
+# 下载 DuckDB 原生内核 (default pin in download_libduckdb.sh)
 RUN bash ./download_libduckdb.sh
 
 # 编译 duckdb_fdw 2.0 (原生版)
@@ -27,6 +28,7 @@ RUN make USE_PGXS=1 && \
     make install USE_PGXS=1
 
 # 第二阶段：运行环境
+ARG POSTGRES_VERSION=17
 FROM postgres:${POSTGRES_VERSION}
 ARG POSTGRES_VERSION=17
 
@@ -37,6 +39,8 @@ RUN apt-get update && apt-get install -y libstdc++6 && rm -rf /var/lib/apt/lists
 COPY --from=builder /usr/lib/postgresql/${POSTGRES_VERSION}/lib/duckdb_fdw.so /usr/lib/postgresql/${POSTGRES_VERSION}/lib/
 COPY --from=builder /usr/share/postgresql/${POSTGRES_VERSION}/extension/duckdb_fdw* /usr/share/postgresql/${POSTGRES_VERSION}/extension/
 COPY --from=builder /build/libduckdb.so /usr/local/lib/
+# Also place beside the extension for $ORIGIN rpath resolution
+COPY --from=builder /build/libduckdb.so /usr/lib/postgresql/${POSTGRES_VERSION}/lib/
 
 # 刷新动态库缓存
 RUN ldconfig

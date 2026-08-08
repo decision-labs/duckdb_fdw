@@ -1,6 +1,7 @@
 ## Unreleased
 
 ### Maintenance
+- Bump default embedded DuckDB bootstrap to v1.5.5 (was 1.5.1) for currency and ducklake:quack (~1.5.4+).
 - Restricted admin-like helper execution by default and aligned public capability claims with the code-backed chunk-result read path.
 - Added transaction-scoped connection cache cleanup and routed foreign path creation through a shared costing helper.
 - Added contributor onboarding guidance and deterministic DuckDB bootstrap defaults.
