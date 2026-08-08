@@ -47,8 +47,9 @@ jobs:
         # Wait for service
         while ! pg_isready; do sleep 1; done
         
-        # Configure User
+        # Configure User / default database
         sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = 'postgres'" | grep -q 1           || sudo -u postgres createdb -O postgres postgres
 
     # --- macOS Setup ---
     - name: Install Dependencies (macOS)
@@ -104,6 +105,7 @@ jobs:
       env:
         PGPASSWORD: postgres
         PGUSER: postgres
+        PGDATABASE: postgres
         PGHOST: localhost
         PGPORT: 5432
         TEST_PROFILE: ${{ github.event.inputs.test_profile || 'core' }}
@@ -113,14 +115,20 @@ jobs:
            exit 0
         fi
         
-        # macOS specific overrides
+        # macOS specific overrides (peer auth as the runner user)
         if [ "$RUNNER_OS" == "macOS" ]; then
            export PGUSER=$(whoami)
-           export PGPASSWORD=""
-           export PGHOST="/tmp" 
-           # Ensure PGHOST matches where brew postgres listens. Often /tmp or /var/run/...
-           # 'createdb' worked, so 'psql' should work with default env.
+           export PGHOST="/tmp"
+           export PGDATABASE="${PGDATABASE:-postgres}"
            unset PGPASSWORD
+           createdb "$PGDATABASE" 2>/dev/null || true
+        fi
+
+        # Ensure the target database exists (Linux apt packages usually ship "postgres")
+        if [ "$RUNNER_OS" == "Linux" ]; then
+           export PGDATABASE="${PGDATABASE:-postgres}"
+           PGPASSWORD="${PGPASSWORD:-postgres}" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tc "SELECT 1" >/dev/null
+           PGPASSWORD="${PGPASSWORD:-postgres}" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${PGDATABASE}'" | grep -q 1              || PGPASSWORD="${PGPASSWORD:-postgres}" createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$PGDATABASE"
         fi
         
         if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then

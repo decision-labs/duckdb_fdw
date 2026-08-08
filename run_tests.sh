@@ -39,7 +39,13 @@ PSQL_BIN=${PSQL_BIN:-psql}
 PGPORT=${PGPORT:-5433}
 PGHOST=${PGHOST:-/tmp}
 PGUSER=${PGUSER:-$(whoami)}
-PGDATABASE=${PGDATABASE:-$(whoami)}
+if [ -n "${PGDATABASE:-}" ]; then
+    :
+elif [ "$PGUSER" = "postgres" ]; then
+    PGDATABASE=postgres
+else
+    PGDATABASE=$(whoami)
+fi
 
 echo -e "${BLUE}====================================================${NC}"
 echo -e "${BLUE}      pg_duck (DuckDB FDW) 自动化集成测试脚本        ${NC}"
@@ -53,6 +59,16 @@ fi
 echo -e "${YELLOW}测试档位: ${PROFILE}${NC}"
 if [[ "${RUN_PG_DUCKDB_COEXISTENCE_CHECK}" == "1" ]]; then
     echo -e "${YELLOW}附加验证: 启用 pg_duckdb 共存守卫检查${NC}"
+fi
+
+# Ensure the configured database exists when possible (best-effort).
+if command -v "$PSQL_BIN" >/dev/null 2>&1; then
+    if ! "$PSQL_BIN" -v ON_ERROR_STOP=1 -p "$PGPORT" -h "$PGHOST" -d "$PGDATABASE" -U "$PGUSER" -tc "SELECT 1" >/dev/null 2>&1; then
+        if command -v createdb >/dev/null 2>&1; then
+            echo -e "${YELLOW}数据库 ${PGDATABASE} 不存在，尝试 createdb...${NC}"
+            createdb -p "$PGPORT" -h "$PGHOST" -U "$PGUSER" "$PGDATABASE" 2>/dev/null || true
+        fi
+    fi
 fi
 
 # 1. 编译
