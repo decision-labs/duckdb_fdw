@@ -20,6 +20,7 @@
 | Secret helper (`duckdb_create_s3_secret`) | Implemented | SQL function + `duckdb_fdw.c` | S3 credentials |
 | MotherDuck integration | Implemented | `motherduck_token` option + auto-extension loading | MotherDuck account |
 | Quack client-server protocol | Implemented | via `extensions 'quack'` + `duckdb_execute` | DuckDB with Quack extension |
+| DuckLake catalog over Quack | Implemented | `ducklake_quack_host` + `data_path`; `examples/19_ducklake_quack.sql` | DuckDB with `quack` + `ducklake` |
 | Runtime coexistence guard for `pg_duckdb` | Implemented (Linux-first) | `runtime_guard.c`, `scripts/verify_pg_duckdb_coexistence.sh` | Same-backend peer detection |
 | Iceberg/S3 examples | Partial | `examples/07-13` | Network, optional credentials |
 | Full Arrow C Data scan path | Planned | no `duckdb_query_arrow` call in active scan path; tracked as future work | future release |
@@ -279,7 +280,40 @@ SELECT duckdb_execute('quack_srv',
     ATTACH 'quack:remote-host:9494' AS remote_db;$$);
 ```
 
-### 8. Arbitrary DuckDB SQL
+### 8. DuckLake catalog over Quack (`ducklake:quack:`)
+
+This is **not** Quack proxy mode (`quack_host` → `ATTACH 'quack:host' AS remote`). It attaches a **DuckLake catalog whose metadata is served by Quack**, with Parquet on S3/RustFS — the same recipe Geobase clients use:
+
+```sql
+ATTACH 'ducklake:quack:host:443' AS my_ducklake (DATA_PATH 's3://bucket');
+```
+
+Put the host:port in `ducklake_quack_host`, the bucket in `data_path`, S3 endpoint/style on the server, and tokens/keys in **USER MAPPING**. Do not combine with `quack_host`.
+
+```sql
+CREATE SERVER lake FOREIGN DATA WRAPPER duckdb_fdw OPTIONS (
+    ducklake_quack_host 'myproject.dl.example.com:443',
+    data_path 's3://myproject',
+    s3_endpoint 's3.dl.example.com',
+    s3_use_ssl 'true',
+    s3_url_style 'path',
+    disable_ssl 'true'   -- local Quack has no TLS; omit on :443 / SWAG
+);
+CREATE USER MAPPING FOR CURRENT_USER SERVER lake OPTIONS (
+    quack_token 'gdl_...',
+    s3_access_key_id 'YOUR_KEY',
+    s3_secret_access_key 'YOUR_SECRET'
+);
+IMPORT FOREIGN SCHEMA main FROM SERVER lake INTO public;
+```
+
+On every DuckDB open, duckdb_fdw `INSTALL`/`LOAD`s `httpfs`, `quack`, and `ducklake`, creates the S3 + Quack secrets, then ATTACHes `ducklake:quack:{host}` as `my_ducklake` (override with `ducklake_alias`). `IMPORT FOREIGN SCHEMA main` reads `my_ducklake.main`, not `remote.main`.
+
+`s3_url_style` is `path` or `vhost`. Omit it for AWS virtual-hosted buckets; set `path` for S3-compatible stores such as RustFS.
+
+> Requires: DuckDB >= 1.5.3 with `quack` and `ducklake` extensions. The host string is opaque — include `:443` or `:9494` yourself.
+
+### 9. Arbitrary DuckDB SQL
 
 The `duckdb_execute()` function lets you run any DuckDB SQL through the FDW connection — useful for DDL, extension management, or one-off operations:
 
