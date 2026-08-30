@@ -309,6 +309,8 @@ IMPORT FOREIGN SCHEMA main FROM SERVER lake INTO public;
 
 On every DuckDB open, duckdb_fdw `INSTALL`/`LOAD`s `httpfs`, `quack`, and `ducklake`, creates the S3 + Quack secrets, then ATTACHes `ducklake:quack:{host}` as `my_ducklake` (override with `ducklake_alias`). `IMPORT FOREIGN SCHEMA main` reads `my_ducklake.main`, not `remote.main`.
 
+Live session (SELECT + INSERT through the FDW): [`examples/asciinema/ducklake-quack-live.cast`](examples/asciinema/ducklake-quack-live.cast) — `asciinema play` that file, or [watch online](https://asciinema.org/a/3CMqlXt6oIx4us6I).
+
 `s3_url_style` is `path` or `vhost`. Omit it for AWS virtual-hosted buckets; set `path` for S3-compatible stores such as RustFS.
 
 > Requires: DuckDB >= 1.5.3 with `quack` and `ducklake` extensions. The host string is opaque — include `:443` or `:9494` yourself.
