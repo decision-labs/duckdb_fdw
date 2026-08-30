@@ -11,3 +11,5 @@ Play locally:
 ```bash
 asciinema play examples/asciinema/ducklake-quack-live.cast
 ```
+
+Online player (anonymous upload, may expire): https://asciinema.org/a/BF8xMlpOH6ogR7He
