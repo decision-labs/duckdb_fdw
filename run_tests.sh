@@ -110,6 +110,7 @@ CORE_TEST_FILES=(
     "examples/16_aggregate_pushdown.sql"
     "examples/17_join_pushdown_test.sql"
     "examples/18_high_performance_v2.sql"
+    "examples/19_ducklake_quack.sql"
 )
 
 INTEGRATION_TEST_FILES=(
@@ -118,6 +119,7 @@ INTEGRATION_TEST_FILES=(
     "examples/09_ducklake_import.sql"
     "examples/10_iceberg_direct_scan.sql"
     "examples/11_sf3_analytics.sql"
+    "examples/20_ducklake_quack_live.sql"
 )
 
 CLOUD_TEST_FILES=(
@@ -162,6 +164,20 @@ if [[ "$PROFILE" == "core" || "$PROFILE" == "all" ]]; then
     fi
 fi
 
+# Skip live DuckLake-over-Quack unless a Quack host is provided.
+if [[ "$PROFILE" == "integration" || "$PROFILE" == "all" ]]; then
+    if [[ -z "${DUCKLAKE_QUACK_HOST:-}" ]]; then
+        echo -e "${YELLOW}未设置 DUCKLAKE_QUACK_HOST，跳过 examples/20_ducklake_quack_live.sql${NC}"
+        FILTERED_TEST_FILES=()
+        for f in "${TEST_FILES[@]}"; do
+            if [[ "$f" != "examples/20_ducklake_quack_live.sql" ]]; then
+                FILTERED_TEST_FILES+=("$f")
+            fi
+        done
+        TEST_FILES=("${FILTERED_TEST_FILES[@]}")
+    fi
+fi
+
 # 2.5 加载本地环境变量 (.env)
 if [ -f .env ]; then
     export $(grep -v '^#' .env | xargs)
@@ -189,8 +205,16 @@ for f in "${TEST_FILES[@]}"; do
     # 1. 构造 sed 替换序列
     # 使用 @ 作为分隔符，避免路径中的 / 冲突
     SED_EXPR="s@\\@PROJECT_PATH@$CURRENT_DIR@g"
-    if [ ! -z "$S3_ACCESS_KEY" ]; then
+    if [ ! -z "${S3_ACCESS_KEY:-}" ]; then
         SED_EXPR="$SED_EXPR; s@YOUR_ACCESS_KEY@$S3_ACCESS_KEY@g; s@YOUR_SECRET_KEY@$S3_SECRET_KEY@g"
+    fi
+    if [ ! -z "${DUCKLAKE_QUACK_HOST:-}" ]; then
+        SED_EXPR="$SED_EXPR; s@YOUR_QUACK_HOST@${DUCKLAKE_QUACK_HOST}@g"
+        SED_EXPR="$SED_EXPR; s@YOUR_DATA_PATH@${DATA_PATH:-s3://kroobay}@g"
+        SED_EXPR="$SED_EXPR; s@YOUR_S3_ENDPOINT@${S3_ENDPOINT:-localhost:9000}@g"
+        SED_EXPR="$SED_EXPR; s@YOUR_QUACK_TOKEN@${QUACK_TOKEN:-}@g"
+        SED_EXPR="$SED_EXPR; s@YOUR_S3_USE_SSL@${S3_USE_SSL:-false}@g"
+        SED_EXPR="$SED_EXPR; s@YOUR_DISABLE_SSL@${DISABLE_SSL:-true}@g"
     fi
 
     # 2. Pipe SQL into psql. After each CREATE SERVER, ensure a USER MAPPING

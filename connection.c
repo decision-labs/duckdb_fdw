@@ -130,9 +130,15 @@ duckdb_setup_secrets_and_extensions(duckdb_connection conn, ForeignServer *serve
     char *s3_secret_key = NULL;
     char *s3_endpoint = NULL;
     bool s3_use_ssl = true;
+    char *s3_url_style = NULL;
     char *extensions = NULL;
     char *attach_catalogs = NULL;
     char *motherduck_token = NULL;
+    char *quack_token = NULL;
+    char *ducklake_quack_host = NULL;
+    char *data_path = NULL;
+    char *ducklake_alias = "my_ducklake";
+    bool disable_ssl = false;
     ListCell *lc;
     Oid userid = GetUserId();
 
@@ -152,6 +158,8 @@ duckdb_setup_secrets_and_extensions(duckdb_connection conn, ForeignServer *serve
                     s3_secret_key = defGetString(def);
                 else if (strcmp(def->defname, "motherduck_token") == 0)
                     motherduck_token = defGetString(def);
+                else if (strcmp(def->defname, "quack_token") == 0)
+                    quack_token = defGetString(def);
             }
         }
     }
@@ -165,22 +173,35 @@ duckdb_setup_secrets_and_extensions(duckdb_connection conn, ForeignServer *serve
         else if (strcmp(def->defname, "s3_secret_access_key") == 0 && s3_secret_key == NULL) s3_secret_key = defGetString(def);
         else if (strcmp(def->defname, "s3_endpoint") == 0) s3_endpoint = defGetString(def);
         else if (strcmp(def->defname, "s3_use_ssl") == 0) s3_use_ssl = defGetBoolean(def);
+        else if (strcmp(def->defname, "s3_url_style") == 0) s3_url_style = defGetString(def);
         else if (strcmp(def->defname, "extensions") == 0) extensions = defGetString(def);
         else if (strcmp(def->defname, "attach_catalogs") == 0) attach_catalogs = defGetString(def);
         else if (strcmp(def->defname, "motherduck_token") == 0 && motherduck_token == NULL)
             motherduck_token = defGetString(def);
+        else if (strcmp(def->defname, "quack_token") == 0 && quack_token == NULL)
+            quack_token = defGetString(def);
+        else if (strcmp(def->defname, "ducklake_quack_host") == 0)
+            ducklake_quack_host = defGetString(def);
+        else if (strcmp(def->defname, "data_path") == 0)
+            data_path = defGetString(def);
+        else if (strcmp(def->defname, "ducklake_alias") == 0)
+            ducklake_alias = defGetString(def);
+        else if (strcmp(def->defname, "disable_ssl") == 0)
+            disable_ssl = defGetBoolean(def);
     }
 
     /* 2. Intelligent Extension Autoloading */
     {
-        bool need_httpfs = (s3_access_key != NULL);
+        bool need_httpfs = (s3_access_key != NULL || ducklake_quack_host != NULL);
         bool need_iceberg = false;
         bool need_motherduck = (motherduck_token != NULL);
+        bool need_ducklake_quack = (ducklake_quack_host != NULL);
 
         if (attach_catalogs)
         {
-            /* DuckLake resource types are handled by the 'iceberg' extension */
-            if (strstr(attach_catalogs, "type=iceberg") || strstr(attach_catalogs, "type=ducklake"))
+            /* HTTP .ducklake snapshots / Iceberg REST catalogs use iceberg */
+            if (strstr(attach_catalogs, "type=iceberg") || strstr(attach_catalogs, "type=ducklake") ||
+                strstr(attach_catalogs, "type ducklake") || strstr(attach_catalogs, "type iceberg"))
             {
                 need_iceberg = true;
                 need_httpfs = true;
@@ -191,6 +212,12 @@ duckdb_setup_secrets_and_extensions(duckdb_connection conn, ForeignServer *serve
         if (need_httpfs) duckdb_do_sql_command(conn, "INSTALL 'httpfs'; LOAD 'httpfs';", ERROR);
         if (need_iceberg) duckdb_do_sql_command(conn, "INSTALL 'iceberg'; LOAD 'iceberg';", ERROR);
         if (need_motherduck) duckdb_do_sql_command(conn, "INSTALL 'motherduck'; LOAD 'motherduck';", ERROR);
+        if (need_ducklake_quack)
+        {
+            duckdb_do_sql_command(conn, "INSTALL 'quack'; LOAD 'quack';", ERROR);
+            duckdb_do_sql_command(conn, "INSTALL 'ducklake'; LOAD 'ducklake';", ERROR);
+            duckdb_do_sql_command(conn, "SET httpfs_connection_caching = true;", ERROR);
+        }
 
 	        /* Also load any manually specified extensions */
 		        if (extensions)
@@ -206,7 +233,8 @@ duckdb_setup_secrets_and_extensions(duckdb_connection conn, ForeignServer *serve
 		                    token = duckdb_fdw_next_token(NULL, ",", &saveptr);
 		                    continue;
 		                }
-		                if (strcmp(trimmed, "httpfs") != 0 && strcmp(trimmed, "iceberg") != 0)
+		                if (strcmp(trimmed, "httpfs") != 0 && strcmp(trimmed, "iceberg") != 0 &&
+                    strcmp(trimmed, "quack") != 0 && strcmp(trimmed, "ducklake") != 0)
 		                    install_extension_if_valid(conn, trimmed);
 		                token = duckdb_fdw_next_token(NULL, ",", &saveptr);
 		            }
@@ -222,6 +250,8 @@ duckdb_setup_secrets_and_extensions(duckdb_connection conn, ForeignServer *serve
 			char *secret_lit = duckdb_fdw_quote_literal(s3_secret_key);
 	        initStringInfo(&sql);
 	        appendStringInfoString(&sql, "CREATE OR REPLACE SECRET pg_duck_s3 ( TYPE S3, ");
+            if (s3_url_style || ducklake_quack_host)
+                appendStringInfoString(&sql, "PROVIDER config, ");
 	        appendStringInfo(&sql, "KEY_ID %s, ", key_lit);
 	        appendStringInfo(&sql, "SECRET %s, ", secret_lit);
 	        if (s3_region)
@@ -236,6 +266,12 @@ duckdb_setup_secrets_and_extensions(duckdb_connection conn, ForeignServer *serve
 				appendStringInfo(&sql, "ENDPOINT %s, ", endpoint_lit);
 				pfree(endpoint_lit);
 			}
+            if (s3_url_style)
+            {
+                char *style_lit = duckdb_fdw_quote_literal(s3_url_style);
+                appendStringInfo(&sql, "URL_STYLE %s, ", style_lit);
+                pfree(style_lit);
+            }
 	        appendStringInfo(&sql, "USE_SSL %s );", s3_use_ssl ? "true" : "false");
 	        duckdb_do_sql_command(conn, sql.data, ERROR);
 			pfree(key_lit);
@@ -254,6 +290,57 @@ duckdb_setup_secrets_and_extensions(duckdb_connection conn, ForeignServer *serve
         duckdb_do_sql_command(conn, sql.data, ERROR);
         pfree(token_lit);
         pfree(sql.data);
+    }
+
+    /* 4b. DuckLake catalog over Quack (before attach_catalogs so secrets exist) */
+    if (ducklake_quack_host)
+    {
+        char *uri;
+        char *uri_lit;
+        char *alias_id;
+        char *path_lit;
+        char *attach_sql;
+
+        if (!data_path)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("ducklake_quack_host requires data_path")));
+        if (!duckdb_fdw_is_valid_identifier(ducklake_alias))
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("invalid ducklake_alias \"%s\"", ducklake_alias)));
+        if (!duckdb_fdw_is_safe_sql_fragment(ducklake_quack_host))
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("ducklake_quack_host contains an unsafe SQL fragment")));
+        if (!duckdb_fdw_is_safe_sql_fragment(data_path))
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("data_path contains an unsafe SQL fragment")));
+
+        if (quack_token)
+        {
+            char *token_lit = duckdb_fdw_quote_literal(quack_token);
+            char *secret_sql = psprintf(
+                "CREATE OR REPLACE SECRET (TYPE quack, TOKEN %s);", token_lit);
+            duckdb_do_sql_command(conn, secret_sql, ERROR);
+            pfree(token_lit);
+            pfree(secret_sql);
+        }
+
+        uri = psprintf("ducklake:quack:%s", ducklake_quack_host);
+        uri_lit = duckdb_fdw_quote_literal(uri);
+        alias_id = duckdb_fdw_quote_identifier(ducklake_alias);
+        path_lit = duckdb_fdw_quote_literal(data_path);
+        attach_sql = psprintf("ATTACH %s AS %s (DATA_PATH %s%s);",
+                              uri_lit, alias_id, path_lit,
+                              disable_ssl ? ", META_DISABLE_SSL true" : "");
+        duckdb_do_sql_command(conn, attach_sql, ERROR);
+        pfree(uri);
+        pfree(uri_lit);
+        pfree(alias_id);
+        pfree(path_lit);
+        pfree(attach_sql);
     }
 
     /* 5. Catalogs (Auto ATTACH) */
@@ -433,6 +520,7 @@ duckdb_get_connection(ForeignServer *server, bool truncatable)
         const char *dbpath = NULL;
         const char *quack_host = NULL;
         const char *quack_token = NULL;
+        const char *ducklake_quack_host = NULL;
         Oid userid = GetUserId();
         ListCell *lc;
 
@@ -460,10 +548,17 @@ duckdb_get_connection(ForeignServer *server, bool truncatable)
                 quack_host = defGetString(def);
             else if (strcmp(def->defname, "quack_token") == 0 && quack_token == NULL)
                 quack_token = defGetString(def);
+            else if (strcmp(def->defname, "ducklake_quack_host") == 0)
+                ducklake_quack_host = defGetString(def);
         }
 
-        /* Quack mode: use in-memory DuckDB if no database specified */
-        if (quack_host && !dbpath)
+        if (quack_host && ducklake_quack_host)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("cannot combine quack_host and ducklake_quack_host")));
+
+        /* Quack / DuckLake-Quack: use in-memory DuckDB if no database specified */
+        if ((quack_host || ducklake_quack_host) && !dbpath)
             dbpath = ":memory:";
 
         if (duckdb_open(dbpath, &entry->db) == DuckDBError)
@@ -479,6 +574,8 @@ duckdb_get_connection(ForeignServer *server, bool truncatable)
             char *host_lit;
             char *attach_sql;
 
+            char *uri;
+
             duckdb_do_sql_command(entry->conn,
                 "INSTALL quack FROM core_nightly; LOAD quack;", ERROR);
 
@@ -492,9 +589,12 @@ duckdb_get_connection(ForeignServer *server, bool truncatable)
                 pfree(secret_sql);
             }
 
-            host_lit = duckdb_fdw_quote_literal(quack_host);
-            attach_sql = psprintf("ATTACH 'quack:%s' AS remote;", quack_host);
+            uri = psprintf("quack:%s", quack_host);
+            host_lit = duckdb_fdw_quote_literal(uri);
+            attach_sql = psprintf("ATTACH %s AS remote;", host_lit);
             duckdb_do_sql_command(entry->conn, attach_sql, ERROR);
+            pfree(uri);
+            pfree(host_lit);
             pfree(attach_sql);
         }
 	}
