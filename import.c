@@ -28,6 +28,7 @@ duckdb_map_type_name(const char *duck_type)
 
     if (strcmp(duck_type, "UUID") == 0) return "uuid";
     if (strcmp(duck_type, "BLOB") == 0) return "bytea";
+    if (strcmp(duck_type, "GEOMETRY") == 0) return "bytea";
     if (strcmp(duck_type, "BIT") == 0) return "bit";
 
     if (strcmp(duck_type, "BOOLEAN") == 0) return "bool";
