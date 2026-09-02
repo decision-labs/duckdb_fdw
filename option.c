@@ -44,6 +44,7 @@ static struct DuckDBFdwOption valid_options[] =
     {"s3_use_ssl", ForeignServerRelationId},
     /* path: https://endpoint/bucket/key (RustFS/MinIO).
      * vhost: https://bucket.endpoint/key (AWS default). */
+    {"s3_url_style", ForeignServerRelationId},
 
     /* S3 credentials can also be set per-user via USER MAPPING (preferred
      * for security — pg_foreign_server options are visible to all users
