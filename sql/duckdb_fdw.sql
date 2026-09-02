@@ -1,4 +1,7 @@
--- Basic Extension Setup
+-- PostGIS is a hard dependency (duckdb_fdw.control requires = postgis).
+-- Quiet PostGIS NOTICE noise that varies by version.
+SET client_min_messages = warning;
+CREATE EXTENSION postgis;
 CREATE EXTENSION duckdb_fdw;
 
 -- Create Server
@@ -94,8 +97,7 @@ SELECT * FROM switch_test_ft;
 DROP FOREIGN TABLE switch_test_ft;
 DROP SERVER duckdb_switch CASCADE;
 
--- BLOB / GEOMETRY scan (no PostGIS required). GEOMETRY imports as bytea;
--- with PostGIS installed, IMPORT would yield geometry instead.
+-- BLOB stays bytea. DuckDB GEOMETRY imports as PostGIS geometry (no bytea fallback).
 CREATE SERVER duckdb_geom FOREIGN DATA WRAPPER duckdb_fdw
 OPTIONS (database '/tmp/duckdb_fdw_regress_geom.db');
 SELECT duckdb_execute('duckdb_geom', 'DROP TABLE IF EXISTS test_blob');
@@ -114,7 +116,7 @@ SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod)
   WHERE n.nspname = 'duckdb_geom_imp' AND a.attnum > 0 AND NOT a.attisdropped
   ORDER BY c.relname, a.attnum;
 SELECT id, encode(b, 'hex') FROM duckdb_geom_imp.test_blob;
-SELECT id, encode(g, 'hex') IS NOT NULL AS geom_no_crash FROM duckdb_geom_imp.test_geom;
+SELECT id, ST_AsText(g) FROM duckdb_geom_imp.test_geom;
 DROP FOREIGN TABLE duckdb_geom_imp.test_blob;
 DROP FOREIGN TABLE duckdb_geom_imp.test_geom;
 DROP SCHEMA duckdb_geom_imp;

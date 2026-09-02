@@ -97,6 +97,18 @@ if ! make install > /dev/null 2>&1; then
 fi
 echo -e "${GREEN}编译完成。${NC}"
 
+# PostGIS is a hard dependency (duckdb_fdw.control requires = postgis).
+# Do not skip tests or fall back to bytea if it is missing.
+PG_SHAREDIR=$(pg_config --sharedir 2>/dev/null)
+if [[ ! -f "$PG_SHAREDIR/extension/postgis.control" ]]; then
+    echo -e "${RED}PostGIS is required to CREATE EXTENSION duckdb_fdw.${NC}"
+    echo "Install postgresql-<major>-postgis-3 (Debian/Ubuntu PGDG) or the postgis package,"
+    echo "then: CREATE EXTENSION postgis WITH SCHEMA extensions;  -- Geobase"
+    echo "   or: CREATE EXTENSION postgis;"
+    echo "Do not link liblwgeom into duckdb_fdw; the geometry type is registered by postgis.so."
+    exit 1
+fi
+
 # 2. 定义测试文件（分层）
 CORE_TEST_FILES=(
     "examples/01_quick_start.sql"

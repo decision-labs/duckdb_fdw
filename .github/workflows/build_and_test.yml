@@ -44,7 +44,9 @@ jobs:
         sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
         wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
         sudo apt-get update
-        sudo apt-get install -y postgresql-${PG_MAJOR} postgresql-client-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR} curl unzip build-essential
+        # postgis is a hard dependency (duckdb_fdw.control requires = postgis).
+        # GEOMETRY has no bytea fallback; fail the job if this package is missing.
+        sudo apt-get install -y postgresql-${PG_MAJOR} postgresql-client-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR} postgresql-${PG_MAJOR}-postgis-3 curl unzip build-essential
 
         # Prefer the matrix major for pg_config/psql/pg_isready
         echo "${PG_BIN}" >> "$GITHUB_PATH"
@@ -97,6 +99,10 @@ jobs:
       if: runner.os == 'macOS'
       run: |
         brew install postgresql@${{ matrix.pg_version }}
+        # Same hard PostGIS requirement as Linux. If brew's postgis does not
+        # register against this postgresql@major, CREATE EXTENSION must fail
+        # (run_tests.sh checks for postgis.control) — do not skip or map to bytea.
+        brew install postgis
         brew services start postgresql@${{ matrix.pg_version }}
         
         # Link brew postgres path

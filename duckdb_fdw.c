@@ -701,7 +701,7 @@ duckdb_value_to_pg(DuckDBFdwExecState *festate, int col_idx, uint64_t global_row
 {
 	Datum		blob_datum;
 
-	/* GEOMETRY/BLOB: duckdb_value_blob + soft PostGIS mapping (see duckdb_fdw_geom.c). */
+	/* GEOMETRY/BLOB: duckdb_value_blob + PostGIS geometry (see duckdb_fdw_geom.c). */
 	if (duckdb_fdw_convert_blob_column(&festate->res, col_idx, global_row,
 									   pgtype, &blob_datum))
 		return blob_datum;

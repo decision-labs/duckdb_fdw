@@ -11,15 +11,42 @@
 #include "utils/syscache.h"
 
 /*
- * Cached PostGIS geometry type OID. InvalidOid after a completed lookup
- * means PostGIS is not installed. IMPORT retries a miss so CREATE EXTENSION
- * postgis in the same session still works.
+ * Cached PostGIS geometry type OID. This fork requires PostGIS
+ * (duckdb_fdw.control requires = 'postgis'). Lookup still retries a
+ * miss so a same-session CREATE EXTENSION postgis is visible. Do not
+ * fall back to bytea. Do not link liblwgeom.
  */
 static Oid	duckdb_fdw_geometry_oid = InvalidOid;
 static bool duckdb_fdw_geometry_looked_up = false;
 
 static Oid	duckdb_fdw_st_geomfromwkb_oid = InvalidOid;
 static bool duckdb_fdw_st_geomfromwkb_looked_up = false;
+
+static const char *
+duckdb_fdw_postgis_errhint(void)
+{
+	return "Install PostGIS, then run CREATE EXTENSION postgis WITH SCHEMA extensions; (Geobase) or CREATE EXTENSION postgis;";
+}
+
+static void
+duckdb_fdw_ereport_geometry_missing(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("PostGIS is required for DuckDB GEOMETRY columns"),
+			 errdetail("The geometry type was not found in schema \"extensions\" or search_path."),
+			 errhint("%s", duckdb_fdw_postgis_errhint())));
+}
+
+static void
+duckdb_fdw_ereport_st_geomfromwkb_missing(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot convert DuckDB GEOMETRY to PostGIS geometry"),
+			 errdetail("function ST_GeomFromWKB(bytea) was not found."),
+			 errhint("%s", duckdb_fdw_postgis_errhint())));
+}
 
 static Oid
 duckdb_fdw_lookup_type(const char *nspname, const char *typname)
@@ -68,14 +95,6 @@ duckdb_fdw_geometry_type_oid(bool retry_miss)
 		duckdb_fdw_geometry_oid = duckdb_fdw_lookup_geometry_oid();
 
 	return duckdb_fdw_geometry_oid;
-}
-
-const char *
-duckdb_fdw_geom_pg_type_name(void)
-{
-	if (OidIsValid(duckdb_fdw_geometry_type_oid(true)))
-		return "geometry";
-	return "bytea";
 }
 
 static bool
@@ -151,6 +170,30 @@ duckdb_fdw_st_geomfromwkb(void)
 	return duckdb_fdw_st_geomfromwkb_oid;
 }
 
+static void
+duckdb_fdw_require_postgis(void)
+{
+	if (!OidIsValid(duckdb_fdw_geometry_type_oid(true)))
+		duckdb_fdw_ereport_geometry_missing();
+
+	if (!OidIsValid(duckdb_fdw_st_geomfromwkb()))
+		duckdb_fdw_ereport_st_geomfromwkb_missing();
+}
+
+const char *
+duckdb_fdw_geom_pg_type_name(void)
+{
+	duckdb_fdw_require_postgis();
+
+	/*
+	 * Qualify when PostGIS lives in Geobase's extensions schema so IMPORT
+	 * works even if that schema is not on search_path.
+	 */
+	if (OidIsValid(duckdb_fdw_lookup_type("extensions", "geometry")))
+		return "extensions.geometry";
+	return "geometry";
+}
+
 static Datum
 duckdb_fdw_blob_as_bytea(duckdb_blob blob)
 {
@@ -206,10 +249,7 @@ duckdb_fdw_blob_to_pg_datum(duckdb_blob blob, Oid pgtype)
 		 */
 		func = duckdb_fdw_st_geomfromwkb();
 		if (!OidIsValid(func))
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
-					 errmsg("cannot convert DuckDB GEOMETRY to PostGIS geometry"),
-					 errdetail("st_geomfromwkb(bytea) was not found. Is PostGIS installed?")));
+			duckdb_fdw_ereport_st_geomfromwkb_missing();
 
 		bytea_datum = duckdb_fdw_blob_as_bytea(blob);
 		return OidFunctionCall1(func, bytea_datum);
@@ -217,9 +257,9 @@ duckdb_fdw_blob_to_pg_datum(duckdb_blob blob, Oid pgtype)
 
 	ereport(ERROR,
 			(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
-			 errmsg("cannot convert DuckDB BLOB/GEOMETRY to type %s",
+			 errmsg("cannot convert DuckDB BLOB to type %s",
 					format_type_be(pgtype)),
-			 errhint("Map the column as bytea, text, or PostGIS geometry.")));
+			 errhint("Map BLOB columns as bytea or text.")));
 	return (Datum) 0;
 }
 
@@ -237,6 +277,15 @@ duckdb_fdw_convert_blob_column(duckdb_result *res, int col_idx,
 	if (duck_type != DUCKDB_TYPE_GEOMETRY && duck_type != DUCKDB_TYPE_BLOB)
 		return false;
 
+	if (duck_type == DUCKDB_TYPE_GEOMETRY && !duckdb_fdw_oid_is_geometry(pgtype))
+	{
+		duckdb_fdw_require_postgis();
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+				 errmsg("DuckDB GEOMETRY columns must map to PostGIS geometry"),
+				 errhint("Re-IMPORT the foreign table, or declare the column as geometry.")));
+	}
+
 	if (duckdb_value_is_null(res, col_idx, row))
 	{
 		*out = (Datum) 0;
@@ -247,8 +296,8 @@ duckdb_fdw_convert_blob_column(duckdb_result *res, int col_idx,
 	/*
 	 * The deprecated C API returns data=NULL when the value cannot be
 	 * converted to blob (some native GEOMETRY values). Emit an empty
-	 * blob rather than a null pointer Datum so bytea output does not
-	 * crash. DuckLake / spatial WKB typically has a real buffer.
+	 * blob rather than a null pointer Datum. DuckLake / spatial WKB
+	 * typically has a real buffer.
 	 */
 	if (blob.data == NULL)
 	{

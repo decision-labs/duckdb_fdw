@@ -2,12 +2,15 @@
 #define DUCKDB_FDW_GEOM_H
 
 /*
- * Soft PostGIS mapping for DuckDB GEOMETRY / BLOB.
+ * PostGIS mapping for DuckDB GEOMETRY / BLOB.
  *
  * Fork-local: keep Geobase / PostGIS logic here so rebasing onto
  * alitrack/upstream is a few call-site hunks, not a duckdb_fdw.c rewrite.
  *
- * No liblwgeom. No REQUIRES postgis. Catalog lookup + fmgr only.
+ * Hard requirement: duckdb_fdw.control requires = 'postgis'.
+ * Do not link liblwgeom. The Postgres geometry type is registered by
+ * postgis.so (lwgeom_pg.h / geometry_in / ST_GeomFromWKB), not by
+ * liblwgeom. Catalog lookup + fmgr only.
  */
 
 #include "postgres.h"
@@ -15,8 +18,8 @@
 
 /*
  * PostgreSQL type name for DuckDB GEOMETRY at IMPORT time.
- * "geometry" if PostGIS geometry exists (extensions, then search_path),
- * otherwise "bytea".
+ * Always PostGIS geometry (schema-qualified when found in "extensions").
+ * Errors if geometry or ST_GeomFromWKB is missing.
  */
 extern const char *duckdb_fdw_geom_pg_type_name(void);
 
@@ -24,10 +27,11 @@ extern const char *duckdb_fdw_geom_pg_type_name(void);
  * Convert a DuckDB blob (ISO WKB for GEOMETRY, raw bytes for BLOB)
  * to a PostgreSQL Datum of pgtype.
  *
- * bytea  -> raw varlena
- * text   -> \x hex
+ * bytea  -> raw varlena (BLOB only)
+ * text   -> \x hex (BLOB only)
  * geometry (PostGIS) -> ST_GeomFromWKB(bytea); SRID left 0
  *
+ * DuckDB GEOMETRY must be PostGIS geometry — no bytea/text fallback.
  * Does not call geometry_in on hex (that often fails).
  */
 extern Datum duckdb_fdw_blob_to_pg_datum(duckdb_blob blob, Oid pgtype);
