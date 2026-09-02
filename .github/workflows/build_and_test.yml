@@ -44,7 +44,9 @@ jobs:
         sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
         wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
         sudo apt-get update
-        sudo apt-get install -y postgresql-${PG_MAJOR} postgresql-client-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR} curl unzip build-essential
+        # postgis is a hard dependency (duckdb_fdw.control requires = postgis).
+        # GEOMETRY has no bytea fallback; fail the job if this package is missing.
+        sudo apt-get install -y postgresql-${PG_MAJOR} postgresql-client-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR} postgresql-${PG_MAJOR}-postgis-3 curl unzip build-essential
 
         # Prefer the matrix major for pg_config/psql/pg_isready
         echo "${PG_BIN}" >> "$GITHUB_PATH"
@@ -86,6 +88,8 @@ jobs:
         sudo -u postgres "${PG_BIN}/psql" -c "ALTER USER postgres PASSWORD 'postgres';"
         sudo -u postgres "${PG_BIN}/psql" -tc "SELECT 1 FROM pg_database WHERE datname = 'postgres'" | grep -q 1 \
           || sudo -u postgres "${PG_BIN}/createdb" -O postgres postgres
+        # requires = postgis: create the extension before any CREATE EXTENSION duckdb_fdw.
+        sudo -u postgres "${PG_BIN}/psql" -d postgres -c "CREATE EXTENSION IF NOT EXISTS postgis;"
 
         echo "Active clusters:"
         pg_lsclusters
@@ -97,6 +101,10 @@ jobs:
       if: runner.os == 'macOS'
       run: |
         brew install postgresql@${{ matrix.pg_version }}
+        # Same hard PostGIS requirement as Linux. If brew's postgis does not
+        # register against this postgresql@major, CREATE EXTENSION must fail
+        # (run_tests.sh checks for postgis.control) — do not skip or map to bytea.
+        brew install postgis
         brew services start postgresql@${{ matrix.pg_version }}
         
         # Link brew postgres path
@@ -106,8 +114,9 @@ jobs:
         # Wait for service
         sleep 5
         
-        # Create user/db
+        # Create user/db and PostGIS (hard requirement for duckdb_fdw).
         createdb postgres || true
+        psql -d postgres -c "CREATE EXTENSION IF NOT EXISTS postgis;"
 
     # --- Windows Setup ---
     - name: Install Dependencies (Windows)
@@ -168,6 +177,7 @@ jobs:
            export PGDATABASE="${PGDATABASE:-postgres}"
            unset PGPASSWORD
            createdb "$PGDATABASE" 2>/dev/null || true
+           psql -h "$PGHOST" -d "$PGDATABASE" -c "CREATE EXTENSION IF NOT EXISTS postgis;"
         fi
 
         # Ensure the target database exists (Linux apt packages usually ship "postgres")
@@ -178,6 +188,7 @@ jobs:
            PGPASSWORD="${PGPASSWORD:-postgres}" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tc "SELECT version();"
            PGPASSWORD="${PGPASSWORD:-postgres}" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${PGDATABASE}'" | grep -q 1 \
              || PGPASSWORD="${PGPASSWORD:-postgres}" createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$PGDATABASE"
+           PGPASSWORD="${PGPASSWORD:-postgres}" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -c "CREATE EXTENSION IF NOT EXISTS postgis;"
         fi
         
         if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then

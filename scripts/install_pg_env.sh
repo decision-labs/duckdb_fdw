@@ -131,6 +131,8 @@ if [[ "${WITH_SERVER}" -eq 1 ]]; then
     BASE_PACKAGES+=(
         postgresql-"${PG_MAJOR}"
         postgresql-contrib-"${PG_MAJOR}"
+        # duckdb_fdw.control requires = postgis (no GEOMETRY→bytea fallback)
+        postgresql-"${PG_MAJOR}"-postgis-3
     )
 fi
 

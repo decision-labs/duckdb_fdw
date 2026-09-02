@@ -1,4 +1,5 @@
 -- 12 S3 Tables Direct Test
+CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS duckdb_fdw;
 
 DROP SERVER IF EXISTS s3_tables_srv CASCADE;

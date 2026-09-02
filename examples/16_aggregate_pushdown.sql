@@ -2,6 +2,7 @@
 -- This example demonstrates pushing down aggregation functions (SUM, AVG, COUNT, MIN, MAX) 
 -- to DuckDB, which is much more efficient than fetching all rows and aggregating in PostgreSQL.
 
+CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS duckdb_fdw;
 
 -- 1. Setup Server

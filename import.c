@@ -1,5 +1,6 @@
 #include "postgres.h"
 #include "duckdb_fdw.h"
+#include "duckdb_fdw_geom.h"
 #include "duckdb.h"
 
 #include "access/xact.h"
@@ -28,6 +29,8 @@ duckdb_map_type_name(const char *duck_type)
 
     if (strcmp(duck_type, "UUID") == 0) return "uuid";
     if (strcmp(duck_type, "BLOB") == 0) return "bytea";
+    if (pg_strcasecmp(duck_type, "GEOMETRY") == 0)
+        return duckdb_fdw_geom_pg_type_name();
     if (strcmp(duck_type, "BIT") == 0) return "bit";
 
     if (strcmp(duck_type, "BOOLEAN") == 0) return "bool";
@@ -69,22 +72,36 @@ duckdb_import_foreign_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
     duckdb_result res;
     StringInfoData query;
     bool is_file = false;
-    bool is_quack = false;
-    const char *quack_prefix = "";
+    const char *catalog_prefix = "";
+    char *ducklake_prefix = NULL;
+    bool is_ducklake_quack = false;
+    const char *ducklake_alias = "my_ducklake";
 
-    /* Detect Quack proxy mode: if server has quack_host, tables live in
-     * the ATTACHed 'remote' database and catalog queries need the prefix. */
+    /* Detect Quack proxy vs DuckLake-over-Quack: catalog queries need a prefix. */
     {
         ListCell *lc;
+
         foreach(lc, server->options)
         {
             DefElem *def = (DefElem *) lfirst(lc);
             if (strcmp(def->defname, "quack_host") == 0)
             {
-                is_quack = true;
-                quack_prefix = "remote.";
-                break;
+                catalog_prefix = "remote.";
             }
+            else if (strcmp(def->defname, "ducklake_quack_host") == 0)
+                is_ducklake_quack = true;
+            else if (strcmp(def->defname, "ducklake_alias") == 0)
+                ducklake_alias = defGetString(def);
+        }
+        if (is_ducklake_quack)
+        {
+            if (!duckdb_fdw_is_valid_identifier(ducklake_alias))
+                ereport(ERROR,
+                        (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                         errmsg("invalid ducklake_alias \"%s\"", ducklake_alias)));
+            /* DESCRIBE uses alias.schema.table; duckdb_tables() is not inside the lake. */
+            ducklake_prefix = psprintf("%s.", ducklake_alias);
+            catalog_prefix = ducklake_prefix;
         }
     }
 
@@ -153,11 +170,25 @@ duckdb_import_foreign_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 						(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 						 errmsg("remote schema contains unsafe SQL fragment")));
 			remote_schema_lit = duckdb_fdw_quote_literal(stmt->remote_schema);
-	        appendStringInfo(&query,
-	            "SELECT database_name, schema_name, table_name "
-	            "FROM %sduckdb_tables() "
-	            "WHERE database_name = %s OR schema_name = %s",
-	            quack_prefix, remote_schema_lit, remote_schema_lit);
+            if (is_ducklake_quack)
+            {
+                char *alias_lit = duckdb_fdw_quote_literal(ducklake_alias);
+
+                appendStringInfo(&query,
+                    "SELECT database_name, schema_name, table_name "
+                    "FROM duckdb_tables() "
+                    "WHERE database_name = %s AND schema_name = %s",
+                    alias_lit, remote_schema_lit);
+                pfree(alias_lit);
+            }
+            else
+            {
+                appendStringInfo(&query,
+                    "SELECT database_name, schema_name, table_name "
+                    "FROM %sduckdb_tables() "
+                    "WHERE database_name = %s OR schema_name = %s",
+                    catalog_prefix, remote_schema_lit, remote_schema_lit);
+            }
 			pfree(remote_schema_lit);
 
         if (duckdb_query(conn, query.data, &tables_res) == DuckDBError)
@@ -179,9 +210,13 @@ duckdb_import_foreign_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
             appendStringInfo(&ddl, "CREATE FOREIGN TABLE %s.%s (",
                              quote_identifier(stmt->local_schema), quote_identifier(tname));
 
-            appendStringInfo(&desc_query, "DESCRIBE SELECT * FROM %s%s.%s.%s",
-                             quack_prefix,
-                             quote_identifier(dbname), quote_identifier(schname), quote_identifier(tname));
+            if (is_ducklake_quack)
+                appendStringInfo(&desc_query, "DESCRIBE SELECT * FROM %s.%s.%s",
+                                 quote_identifier(dbname), quote_identifier(schname), quote_identifier(tname));
+            else
+                appendStringInfo(&desc_query, "DESCRIBE SELECT * FROM %s%s.%s.%s",
+                                 catalog_prefix,
+                                 quote_identifier(dbname), quote_identifier(schname), quote_identifier(tname));
 
 	            if (duckdb_query(conn, desc_query.data, &col_res) != DuckDBError)
 	            {
@@ -217,6 +252,9 @@ duckdb_import_foreign_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
         }
         duckdb_destroy_result(&tables_res);
     }
+
+    if (ducklake_prefix)
+        pfree(ducklake_prefix);
 
     SPI_finish();
     return NIL;
