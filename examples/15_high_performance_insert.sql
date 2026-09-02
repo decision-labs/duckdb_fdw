@@ -2,6 +2,7 @@
 -- This example demonstrates the new Appender-based write support which is
 -- significantly faster than individual SQL INSERT statements.
 
+CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS duckdb_fdw;
 
 -- 1. Setup Server

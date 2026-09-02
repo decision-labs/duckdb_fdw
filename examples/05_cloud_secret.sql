@@ -1,4 +1,5 @@
 -- Clean environment
+CREATE EXTENSION IF NOT EXISTS postgis;
 DROP EXTENSION IF EXISTS duckdb_fdw CASCADE;
 CREATE EXTENSION duckdb_fdw;
 

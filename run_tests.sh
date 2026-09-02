@@ -108,6 +108,14 @@ if [[ ! -f "$PG_SHAREDIR/extension/postgis.control" ]]; then
     echo "Do not link liblwgeom into duckdb_fdw; the geometry type is registered by postgis.so."
     exit 1
 fi
+# Package files are not enough: CREATE EXTENSION duckdb_fdw checks pg_extension.
+if ! "$PSQL_BIN" -v ON_ERROR_STOP=1 -p "$PGPORT" -h "$PGHOST" -d "$PGDATABASE" -U "$PGUSER" \
+    -c "CREATE EXTENSION IF NOT EXISTS postgis;" >/dev/null; then
+    echo -e "${RED}CREATE EXTENSION postgis failed in ${PGDATABASE}.${NC}"
+    echo "PostGIS must be created in the test database before duckdb_fdw."
+    exit 1
+fi
+echo -e "${GREEN}PostGIS extension ready in ${PGDATABASE}.${NC}"
 
 # 2. 定义测试文件（分层）
 CORE_TEST_FILES=(

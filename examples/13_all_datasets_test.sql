@@ -1,4 +1,5 @@
 -- 13 Comprehensive Example Datasets Test (Final Validation)
+CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS duckdb_fdw;
 
 -- Scenario 1: Parquet, train_services

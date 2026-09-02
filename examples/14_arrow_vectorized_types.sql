@@ -2,6 +2,7 @@
 -- This example demonstrates the stability and correctness of the new Arrow vectorized execution path
 -- for various data types including Date, Timestamp, Bool, and Arrays.
 
+CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS duckdb_fdw;
 
 -- 1. Setup Server

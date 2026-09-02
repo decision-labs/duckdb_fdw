@@ -1,4 +1,5 @@
 -- 19 DuckLake-over-Quack option validation (no live lake)
+CREATE EXTENSION IF NOT EXISTS postgis;
 DROP EXTENSION IF EXISTS duckdb_fdw CASCADE;
 CREATE EXTENSION duckdb_fdw;
 
