@@ -1,5 +1,6 @@
 #include "postgres.h"
 #include "duckdb_fdw.h"
+#include "duckdb_fdw_geom.h"
 #include "access/xact.h"
 #include "executor/spi.h"
 #include "utils/uuid.h"
@@ -317,6 +318,7 @@ duckdb_append_slot_row(DuckDBFdwExecState *festate, TupleTableSlot *slot)
 						bool typisvarlena;
 						char *outstr;
 
+						/* Geometry INSERT stays on this varchar path (out of scope). */
 						getTypeOutputInfo(typ, &typoutput, &typisvarlena);
 						outstr = OidOutputFunctionCall(typoutput, val);
 						state = duckdb_append_varchar(festate->appender, outstr);
@@ -695,67 +697,17 @@ duckdbBeginForeignScan(ForeignScanState *node, int eflags)
 }
 
 static Datum
-duckdb_blob_to_pg_datum(duckdb_blob blob, Oid pgtype)
-{
-	bytea	   *result;
-	StringInfoData hex;
-	Datum		res;
-
-	if (pgtype == BYTEAOID)
-	{
-		result = (bytea *) palloc(blob.size + VARHDRSZ);
-		SET_VARSIZE(result, blob.size + VARHDRSZ);
-		memcpy(VARDATA(result), blob.data, blob.size);
-		return PointerGetDatum(result);
-	}
-
-	if (pgtype == TEXTOID || pgtype == VARCHAROID || pgtype == BPCHAROID)
-	{
-		initStringInfo(&hex);
-		appendStringInfoString(&hex, "\\x");
-		for (idx_t i = 0; i < blob.size; i++)
-			appendStringInfo(&hex, "%02x", ((const unsigned char *) blob.data)[i]);
-		res = PointerGetDatum(cstring_to_text(hex.data));
-		pfree(hex.data);
-		return res;
-	}
-
-	{
-		Oid			typinput;
-		Oid			typioparam;
-
-		getTypeInputInfo(pgtype, &typinput, &typioparam);
-		initStringInfo(&hex);
-		appendStringInfoString(&hex, "\\x");
-		for (idx_t i = 0; i < blob.size; i++)
-			appendStringInfo(&hex, "%02x", ((const unsigned char *) blob.data)[i]);
-		res = OidInputFunctionCall(typinput, hex.data, typioparam, -1);
-		pfree(hex.data);
-		return res;
-	}
-}
-
-static Datum
 duckdb_value_to_pg(DuckDBFdwExecState *festate, int col_idx, uint64_t global_row, Oid pgtype)
 {
-	duckdb_type duck_type;
+	Datum		blob_datum;
+
+	/* GEOMETRY/BLOB: duckdb_value_blob + PostGIS geometry (see duckdb_fdw_geom.c). */
+	if (duckdb_fdw_convert_blob_column(&festate->res, col_idx, global_row,
+									   pgtype, &blob_datum))
+		return blob_datum;
 
     if (duckdb_value_is_null(&festate->res, col_idx, global_row))
         return (Datum)0;
-
-	duck_type = duckdb_column_type(&festate->res, (idx_t) col_idx);
-	if (duck_type == DUCKDB_TYPE_GEOMETRY || duck_type == DUCKDB_TYPE_BLOB)
-	{
-		duckdb_blob blob = duckdb_value_blob(&festate->res, (idx_t) col_idx, global_row);
-		Datum		res;
-
-		if (blob.data == NULL)
-			return (Datum) 0;
-
-		res = duckdb_blob_to_pg_datum(blob, pgtype);
-		duckdb_free(blob.data);
-		return res;
-	}
 
     switch (pgtype)
     {

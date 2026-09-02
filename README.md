@@ -22,6 +22,7 @@
 | Quack client-server protocol | Implemented | via `extensions 'quack'` + `duckdb_execute` | DuckDB with Quack extension |
 | DuckLake catalog over Quack | Implemented | `ducklake_quack_host` + `data_path`; `examples/19_ducklake_quack.sql` | DuckDB with `quack` + `ducklake` |
 | Runtime coexistence guard for `pg_duckdb` | Implemented (Linux-first) | `runtime_guard.c`, `scripts/verify_pg_duckdb_coexistence.sh` | Same-backend peer detection |
+| PostGIS GEOMETRY mapping | Implemented | `duckdb_fdw_geom.c`; `requires = postgis`; IMPORT + `duckdb_value_blob` scan | PostGIS (`CREATE EXTENSION postgis`) |
 | Iceberg/S3 examples | Partial | `examples/07-13` | Network, optional credentials |
 | Full Arrow C Data scan path | Planned | no `duckdb_query_arrow` call in active scan path; tracked as future work | future release |
 
@@ -64,6 +65,7 @@ sudo make install
 
 ### Requirements
 * PostgreSQL 13 - 18 (headers required)
+* **PostGIS** (this fork always requires it — `duckdb_fdw.control` has `requires = 'postgis'`). Install the extension package (`postgresql-<major>-postgis-3` on Debian/Ubuntu). Do **not** link `liblwgeom` into duckdb_fdw: that library parses WKB in C, but the Postgres `geometry` type is registered by `postgis.so`.
 * DuckDB library (`libduckdb.so` or `libduckdb.dylib`) with repo-pinned bootstrap default `1.5.5`
 * GCC or Clang with C11/C++11 support
 
@@ -71,12 +73,16 @@ sudo make install
 
 ### 1. Initialize
 ```sql
+-- PostGIS first (Geobase: WITH SCHEMA extensions)
+CREATE EXTENSION postgis;  -- or: CREATE EXTENSION postgis WITH SCHEMA extensions;
 CREATE EXTENSION duckdb_fdw;
 
 CREATE SERVER duckdb_srv 
 FOREIGN DATA WRAPPER duckdb_fdw 
 OPTIONS (database '/tmp/duckdb_fdw_demo.db');
 ```
+
+`CREATE EXTENSION duckdb_fdw` fails if PostGIS is not installed. Postgres's own error is generic (`required extension "postgis" is not installed`); IMPORT/scan also emit a hint to run `CREATE EXTENSION postgis WITH SCHEMA extensions;` (Geobase) or `CREATE EXTENSION postgis;`.
 
 `database ':memory:'` is a connection-scoped temporary database. `duckdb_fdw` now refreshes cached connections at transaction end, so if you create tables or views with `duckdb_execute(...)` and then read them through foreign tables in later SQL statements, use a file-backed DuckDB database by default. If you intentionally want `:memory:`, wrap the entire modeling and query sequence in the same explicit transaction.
 
@@ -161,6 +167,8 @@ OPTIONS (table 's3://my-bucket/data.parquet');
 CREATE SCHEMA remote_tpch;
 IMPORT FOREIGN SCHEMA "tpch" FROM SERVER s3_srv INTO remote_tpch;
 ```
+
+DuckDB `GEOMETRY` maps to PostGIS `geometry` (Geobase: often `extensions.geometry`). There is no `bytea` or `text` fallback. DuckDB `BLOB` (non-geometry) still maps to `bytea`. Scans read `GEOMETRY`/`BLOB` with `duckdb_value_blob()` (ISO WKB → `ST_GeomFromWKB`), never varchar and never via `liblwgeom`. Re-IMPORT foreign tables that were created as `text` or `bytea` before this mapping. INSERT of geometry is not special-cased.
 
 **DuckLake** catalogs (`type=ducklake`) are auto-detected. Just point `attach_catalogs` at a DuckLake URL and duckdb_fdw automatically loads the Iceberg extension:
 

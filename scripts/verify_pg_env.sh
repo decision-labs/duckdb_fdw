@@ -113,6 +113,15 @@ else
     fail "未找到 make"
 fi
 
+if command -v pg_config >/dev/null 2>&1; then
+    POSTGIS_CONTROL="$(pg_config --sharedir 2>/dev/null)/extension/postgis.control"
+    if [[ -f "${POSTGIS_CONTROL}" ]]; then
+        pass "PostGIS 扩展控制文件: ${POSTGIS_CONTROL}"
+    else
+        fail "未找到 PostGIS（${POSTGIS_CONTROL}）。duckdb_fdw.control requires = postgis。安装 postgresql-${PG_MAJOR}-postgis-3，然后 CREATE EXTENSION postgis WITH SCHEMA extensions;（Geobase）或 CREATE EXTENSION postgis;"
+    fi
+fi
+
 if [[ -f ./download_libduckdb.sh ]]; then
     pass "DuckDB bootstrap 脚本存在"
 else

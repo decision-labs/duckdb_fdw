@@ -8,7 +8,7 @@
 #--------------------------------------------------------------------------
 
 MODULE_big = duckdb_fdw
-OBJS = connection.o option.o deparse.o duckdb_fdw.o nanoarrow.o import.o sql_utils.o runtime_guard.o
+OBJS = connection.o option.o deparse.o duckdb_fdw.o nanoarrow.o import.o sql_utils.o runtime_guard.o duckdb_fdw_geom.o
 
 EXTENSION = duckdb_fdw
 DATA = $(wildcard duckdb_fdw--*.sql)

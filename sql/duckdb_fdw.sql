@@ -1,4 +1,7 @@
--- Basic Extension Setup
+-- PostGIS is a hard dependency (duckdb_fdw.control requires = postgis).
+-- Quiet PostGIS NOTICE noise that varies by version.
+SET client_min_messages = warning;
+CREATE EXTENSION postgis;
 CREATE EXTENSION duckdb_fdw;
 
 -- Create Server
@@ -93,6 +96,31 @@ CREATE FOREIGN TABLE switch_test_ft (
 SELECT * FROM switch_test_ft;
 DROP FOREIGN TABLE switch_test_ft;
 DROP SERVER duckdb_switch CASCADE;
+
+-- BLOB stays bytea. DuckDB GEOMETRY imports as PostGIS geometry (no bytea fallback).
+CREATE SERVER duckdb_geom FOREIGN DATA WRAPPER duckdb_fdw
+OPTIONS (database '/tmp/duckdb_fdw_regress_geom.db');
+SELECT duckdb_execute('duckdb_geom', 'DROP TABLE IF EXISTS test_blob');
+SELECT duckdb_execute('duckdb_geom', 'CREATE TABLE test_blob (id INTEGER, b BLOB)');
+SELECT duckdb_execute('duckdb_geom', 'INSERT INTO test_blob VALUES (1, from_hex(''DEADBEEF''))');
+SELECT duckdb_execute('duckdb_geom', 'DROP TABLE IF EXISTS test_geom');
+SELECT duckdb_execute('duckdb_geom', 'CREATE TABLE test_geom (id INTEGER, g GEOMETRY)');
+SELECT duckdb_execute('duckdb_geom', 'INSERT INTO test_geom VALUES (1, ''POINT(1 2)'')');
+DROP SCHEMA IF EXISTS duckdb_geom_imp CASCADE;
+CREATE SCHEMA duckdb_geom_imp;
+IMPORT FOREIGN SCHEMA main FROM SERVER duckdb_geom INTO duckdb_geom_imp;
+SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod)
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  JOIN pg_attribute a ON a.attrelid = c.oid
+  WHERE n.nspname = 'duckdb_geom_imp' AND a.attnum > 0 AND NOT a.attisdropped
+  ORDER BY c.relname, a.attnum;
+SELECT id, encode(b, 'hex') FROM duckdb_geom_imp.test_blob;
+SELECT id, ST_AsText(g) FROM duckdb_geom_imp.test_geom;
+DROP FOREIGN TABLE duckdb_geom_imp.test_blob;
+DROP FOREIGN TABLE duckdb_geom_imp.test_geom;
+DROP SCHEMA duckdb_geom_imp;
+DROP SERVER duckdb_geom CASCADE;
 
 -- Unsupported write paths remain explicit
 UPDATE test_types SET s = 'changed' WHERE i = 1;
