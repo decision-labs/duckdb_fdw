@@ -22,6 +22,7 @@
 | Quack client-server protocol | Implemented | via `extensions 'quack'` + `duckdb_execute` | DuckDB with Quack extension |
 | DuckLake catalog over Quack | Implemented | `ducklake_quack_host` + `data_path`; `examples/19_ducklake_quack.sql` | DuckDB with `quack` + `ducklake` |
 | Runtime coexistence guard for `pg_duckdb` | Implemented (Linux-first) | `runtime_guard.c`, `scripts/verify_pg_duckdb_coexistence.sh` | Same-backend peer detection |
+| Soft PostGIS GEOMETRY mapping | Implemented | `duckdb_fdw_geom.c`; IMPORT + `duckdb_value_blob` scan | Optional PostGIS (not required) |
 | Iceberg/S3 examples | Partial | `examples/07-13` | Network, optional credentials |
 | Full Arrow C Data scan path | Planned | no `duckdb_query_arrow` call in active scan path; tracked as future work | future release |
 
@@ -161,6 +162,8 @@ OPTIONS (table 's3://my-bucket/data.parquet');
 CREATE SCHEMA remote_tpch;
 IMPORT FOREIGN SCHEMA "tpch" FROM SERVER s3_srv INTO remote_tpch;
 ```
+
+DuckDB `GEOMETRY` is optional-PostGIS: `IMPORT FOREIGN SCHEMA` maps it to PostGIS `geometry` when that type exists (Geobase often has it in `extensions`), otherwise `bytea`. The extension does not `REQUIRES` PostGIS. Scans always read `GEOMETRY`/`BLOB` with `duckdb_value_blob()` (ISO WKB), never varchar. Re-IMPORT existing tables that were created as `text` before this mapping. INSERT of geometry is not special-cased.
 
 **DuckLake** catalogs (`type=ducklake`) are auto-detected. Just point `attach_catalogs` at a DuckLake URL and duckdb_fdw automatically loads the Iceberg extension:
 

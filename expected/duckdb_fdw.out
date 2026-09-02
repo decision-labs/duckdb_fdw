@@ -194,6 +194,79 @@ SELECT * FROM switch_test_ft;
 
 DROP FOREIGN TABLE switch_test_ft;
 DROP SERVER duckdb_switch CASCADE;
+-- BLOB / GEOMETRY scan (no PostGIS required). GEOMETRY imports as bytea;
+-- with PostGIS installed, IMPORT would yield geometry instead.
+CREATE SERVER duckdb_geom FOREIGN DATA WRAPPER duckdb_fdw
+OPTIONS (database '/tmp/duckdb_fdw_regress_geom.db');
+SELECT duckdb_execute('duckdb_geom', 'DROP TABLE IF EXISTS test_blob');
+ duckdb_execute 
+----------------
+ 
+(1 row)
+
+SELECT duckdb_execute('duckdb_geom', 'CREATE TABLE test_blob (id INTEGER, b BLOB)');
+ duckdb_execute 
+----------------
+ 
+(1 row)
+
+SELECT duckdb_execute('duckdb_geom', 'INSERT INTO test_blob VALUES (1, from_hex(''DEADBEEF''))');
+ duckdb_execute 
+----------------
+ 
+(1 row)
+
+SELECT duckdb_execute('duckdb_geom', 'DROP TABLE IF EXISTS test_geom');
+ duckdb_execute 
+----------------
+ 
+(1 row)
+
+SELECT duckdb_execute('duckdb_geom', 'CREATE TABLE test_geom (id INTEGER, g GEOMETRY)');
+ duckdb_execute 
+----------------
+ 
+(1 row)
+
+SELECT duckdb_execute('duckdb_geom', 'INSERT INTO test_geom VALUES (1, ''POINT(1 2)'')');
+ duckdb_execute 
+----------------
+ 
+(1 row)
+
+DROP SCHEMA IF EXISTS duckdb_geom_imp CASCADE;
+CREATE SCHEMA duckdb_geom_imp;
+IMPORT FOREIGN SCHEMA main FROM SERVER duckdb_geom INTO duckdb_geom_imp;
+SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod)
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  JOIN pg_attribute a ON a.attrelid = c.oid
+  WHERE n.nspname = 'duckdb_geom_imp' AND a.attnum > 0 AND NOT a.attisdropped
+  ORDER BY c.relname, a.attnum;
+  relname  | attname | format_type 
+-----------+---------+-------------
+ test_blob | id      | integer
+ test_blob | b       | bytea
+ test_geom | id      | integer
+ test_geom | g       | bytea
+(4 rows)
+
+SELECT id, encode(b, 'hex') FROM duckdb_geom_imp.test_blob;
+ id |  encode  
+----+----------
+  1 | deadbeef
+(1 row)
+
+SELECT id, encode(g, 'hex') IS NOT NULL AS geom_no_crash FROM duckdb_geom_imp.test_geom;
+ id | geom_no_crash 
+----+---------------
+  1 | t
+(1 row)
+
+DROP FOREIGN TABLE duckdb_geom_imp.test_blob;
+DROP FOREIGN TABLE duckdb_geom_imp.test_geom;
+DROP SCHEMA duckdb_geom_imp;
+DROP SERVER duckdb_geom CASCADE;
 -- Unsupported write paths remain explicit
 UPDATE test_types SET s = 'changed' WHERE i = 1;
 ERROR:  UPDATE not supported
