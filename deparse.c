@@ -12,6 +12,7 @@
 
 #include "postgres.h"
 #include "duckdb_fdw.h"
+#include "duckdb_fdw_geom.h"
 
 #include "optimizer/tlist.h"
 #include "optimizer/optimizer.h"
@@ -210,6 +211,15 @@ duckdb_deparse_relation(StringInfo buf, Relation rel)
     else if (strstr(relname, "read_parquet") != NULL || strstr(relname, "read_csv") != NULL)
     {
         /* Already a function call, pass as is */
+        appendStringInfo(buf, "%s", relname);
+    }
+    else if (duckdb_fdw_is_table_function_call(relname))
+    {
+        /* A balanced table-function call (e.g. read_json / read_csv_auto /
+         * read_blob) whose name is not in the substring list above. The
+         * string already passed duckdb_fdw_is_safe_sql_fragment() and is a
+         * well-formed call, so emit it verbatim instead of failing to parse
+         * it as a qualified relation name. */
         appendStringInfo(buf, "%s", relname);
     }
 	else if (strchr(relname, '.') != NULL || strchr(relname, '"') != NULL)
@@ -705,7 +715,6 @@ duckdb_foreign_expr_walker(Node *node,
 			}
 			break;
 		case T_OpExpr:
-		case T_NullIfExpr:
 			{
 				char	   *cur_opname = NULL;
 				OpExpr	   *oe = (OpExpr *) node;
@@ -744,6 +753,18 @@ duckdb_foreign_expr_walker(Node *node,
 				}
 
 				/*
+				 * Regex match operators (~ !~ ~* !~*) cannot be pushed down
+				 * to DuckDB: PostgreSQL implements them with POSIX semantics
+				 * (partial match) while DuckDB's regex operators differ in
+				 * collation and matching rules, so evaluate them locally.
+				 */
+				if (strcmp(cur_opname, "~") == 0 || strcmp(cur_opname, "!~") == 0 ||
+					strcmp(cur_opname, "~*") == 0 || strcmp(cur_opname, "!~*") == 0)
+				{
+					return false;
+				}
+
+				/*
 				 * Recurse to input subexpressions.
 				 */
 				if (!duckdb_foreign_expr_walker((Node *) oe->args,
@@ -771,9 +792,85 @@ duckdb_foreign_expr_walker(Node *node,
 					state = FDW_COLLATE_UNSAFE;
 			}
 			break;
+		case T_NullIfExpr:
+			{
+				/*
+				 * In modern PostgreSQL NullIfExpr is a typedef of OpExpr
+				 * (nodes/primnodes.h), so the node is shaped like an OpExpr
+				 * but carries no operator OID of its own: looking up its
+				 * (InvalidOid) opno in the OPEROID cache would be wrong, and
+				 * the opname blacklist does not apply.  The deparser renders
+				 * it as NULLIF()/CASE, which DuckDB evaluates natively, so it
+				 * is safe to push down provided its arguments are pushable
+				 * and its input collation derives from a foreign Var, i.e.
+				 * the OpExpr rule minus the operator checks (same approach as
+				 * postgres_fdw's NullIfExpr branch).
+				 */
+				OpExpr	   *oe = (OpExpr *) node;
+
+				/*
+				 * Recurse to input subexpressions.
+				 */
+				if (!duckdb_foreign_expr_walker((Node *) oe->args,
+												glob_cxt, &inner_cxt))
+					return false;
+
+				/*
+				 * If the operator's input collation is not derived from a
+				 * foreign Var, it can't be sent to remote.
+				 */
+				if (oe->inputcollid == InvalidOid)
+					 /* OK, inputs are all noncollatable */ ;
+				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
+						 oe->inputcollid != inner_cxt.collation)
+					return false;
+
+				/* Result-collation handling is same as for functions */
+				collation = oe->opcollid;
+				if (collation == InvalidOid)
+					state = FDW_COLLATE_NONE;
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 collation == inner_cxt.collation)
+					state = FDW_COLLATE_SAFE;
+				else
+					state = FDW_COLLATE_UNSAFE;
+			}
+			break;
 		case T_ScalarArrayOpExpr:
 			{
 				ScalarArrayOpExpr *oe = (ScalarArrayOpExpr *) node;
+
+				/*
+				 * The deparser parses a constant RHS array char-by-char from
+				 * its text output: it strips braces/quotes and treats every
+				 * comma as an element separator.  That is only correct for pure
+				 * numeric arrays; a text/varchar (or any other) array whose
+				 * elements contain commas, quotes, or NULLs would be re-parsed
+				 * with changed meaning.  So reject any constant array whose
+				 * element type is not one of the plain integer types (and
+				 * OID) and let the expression be evaluated locally.
+				 */
+				{
+					Node	   *rhs = (Node *) lsecond(oe->args);
+
+					if (IsA(rhs, Const))
+					{
+						Const	   *c = (Const *) rhs;
+						Oid			elt = get_element_type(c->consttype);
+
+						/*
+						 * get_element_type() fails (InvalidOid) for non-array
+						 * or domain array types; those are not safe for the
+						 * char-by-char deparse either, so they fall through to
+						 * the local-evaluation path.
+						 */
+						if (elt != INT2OID &&
+							elt != INT4OID &&
+							elt != INT8OID &&
+							elt != OIDOID)
+							return false;
+					}
+				}
 
 				/*
 				 * Again, only built-in operators can be sent to remote.
@@ -858,9 +955,23 @@ duckdb_foreign_expr_walker(Node *node,
 				/* Output is always boolean and so noncollatable. */
 				collation = InvalidOid;
 				state = FDW_COLLATE_NONE;
-			}
-			break;
-		case T_List:
+				}
+				break;
+				case T_SubPlan:
+				case T_SubLink:
+				{
+					/*
+					 * A subquery (IN/EXISTS/(SELECT ...) that the planner turned
+					 * into a SubPlan, or a raw SubLink) executes via PARAM_EXEC
+					 * params.  The fetch loop's nested-param handling is incomplete
+					 * for SubPlans, which segfaults the backend (observed on
+					 * TPC-H Q11 HAVING subquery and Q20 nested IN).  Refuse pushdown
+					 * of any expression containing a subquery so the planner runs it
+					 * locally.
+					 */
+					return false;
+				}
+				case T_List:
 			{
 				List	   *l = (List *) node;
 				ListCell   *lc;
@@ -1470,17 +1581,35 @@ duckdb_deparse_explicit_target_list(List *tlist, List **retrieved_attrs,
 		if (i > 0)
 			appendStringInfoString(buf, ", ");
 
-        /* 
-         * Safety: For complex types (Arrays, Vectors), we must force DuckDB 
-         * to serialize them to text.
+        /*
+         * Safety: For complex types (Arrays, Vectors) we must force DuckDB
+         * to serialize them to text. TEXT/VARCHAR take the CAST branch too:
+         * identity for a real VARCHAR (the cast is optimized away), but
+         * forces serialization when a custom DuckDB type (e.g. spatial
+         * point_2d) is bridged to PG text/varchar -- a bare read segfaults
+         * in duckdb_value_varchar.
          */
-        if (expr_type == INT4OID || 
-            expr_type == INT8OID || 
-            expr_type == FLOAT8OID || 
-            expr_type == BOOLOID ||
-            expr_type == TEXTOID ||
-            expr_type == VARCHAROID)
+        if (expr_type == INT4OID ||
+            expr_type == INT8OID ||
+            expr_type == FLOAT8OID ||
+            expr_type == BOOLOID)
         {
+            duckdb_deparse_expr((Expr *) tle->expr, context);
+        }
+        else if (getBaseType(expr_type) == BYTEAOID)
+        {
+            /* Match the bytea input format used by base relation scans. */
+            appendStringInfoString(buf, "('\\x' || hex(");
+            duckdb_deparse_expr((Expr *) tle->expr, context);
+            appendStringInfoString(buf, "))");
+        }
+        else if (duckdb_fdw_oid_is_geometry(expr_type) ||
+                 duckdb_fdw_oid_is_geometry(getBaseType(expr_type)))
+        {
+            /*
+             * Keep native DuckDB GEOMETRY so duckdb_value_blob() can read
+             * WKB. CAST(... AS VARCHAR) / duckdb_value_varchar segfaults.
+             */
             duckdb_deparse_expr((Expr *) tle->expr, context);
         }
         else
@@ -1922,6 +2051,7 @@ duckdb_deparse_target_list(StringInfo buf,
 	for (i = 1; i <= tupdesc->natts; i++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
+		bool		need_tz_cast;
 
 		/* Ignore dropped attributes. */
 		if (attr->attisdropped)
@@ -1952,27 +2082,91 @@ duckdb_deparse_target_list(StringInfo buf,
              * to serialize them to text. Otherwise duckdb_value_varchar may return NULL.
              * We do this by wrapping the column in a CAST(... AS VARCHAR).
              */
-			                        if (attr->atttypid == INT4OID || 
-			                attr->atttypid == INT8OID || 
-			                attr->atttypid == FLOAT8OID || 
-			                attr->atttypid == BOOLOID ||
-			                attr->atttypid == TEXTOID ||
-			                attr->atttypid == VARCHAROID ||
-			                attr->atttypid == DATEOID ||
-			                attr->atttypid == TIMESTAMPOID ||
-			                attr->atttypid == TIMESTAMPTZOID)
-			            {
-			                /* Safe types: Fetch directly */
-			                            duckdb_deparse_column_ref(buf, rtindex, i, root, qualify_col);
-			            }
-			
-            else
-            {
-                /* Complex types (Array, Vector): Force serialization */
-                appendStringInfoString(buf, "CAST(");
-                duckdb_deparse_column_ref(buf, rtindex, i, root, qualify_col);
-                appendStringInfoString(buf, " AS VARCHAR)");
-            }
+			/*
+			 * 文本回退保护: 本次投影若含复杂列(数组/vector/json/decimal/
+			 * blob 等不在定宽 safe list 的类型)或窄宽度列(INT2/FLOAT4, 见下),
+			 * 整行可能改走文本回退路径
+			 * (duckdb_value_to_pg)。DuckDB C API 对原生 TIMESTAMPTZ 列的
+			 * value 访问器不可用(value_varchar 返回 NULL / value_timestamp
+			 * 返回 0), 会静默读成 epoch(2000-01-01)或 NULL。此时把
+			 * TIMESTAMPTZ 列 CAST AS VARCHAR, 由 PG 的 timestamptz_in 解析
+			 * 字符串; 纯定宽且宽度确切的行不受影响, 仍走 chunk 快速路径。
+			 *
+			 * 判定“哪些 PG 类型算原生定宽/可裸输出”与运行期 chunk 门
+			 * duckdb_can_use_chunk_scan() 共用同一事实源:
+			 * duckdb_pg_type_native_chunk() (duckdb_fdw.h/.c); 历史双白名单
+			 * 靠注释手工同步, 曾导致 TIMESTAMPTZ epoch 与 INT 宽度两类 bug。
+			 */
+			need_tz_cast = false;
+			if (!is_concat && !check_null)
+			{
+				int			ci;
+				Form_pg_attribute ca;
+
+				for (ci = 1; ci <= tupdesc->natts; ci++)
+				{
+					ca = TupleDescAttr(tupdesc, ci - 1);
+
+					if (ca->attisdropped)
+						continue;
+					if (!bms_is_member(ci - FirstLowInvalidHeapAttributeNumber,
+										   attrs_used))
+						continue;
+				/*
+				 * 触发条件 = “整行运行期可能走文本回退”的保守超集 (计划期
+				 * 无法预知运行期 DuckDB 类型), 两类:
+				 *  (a) duckdb_pg_type_native_chunk() 判为“非原生定宽”的列
+				 *      (数组/json 等): deparse 将其包成 CAST(... AS VARCHAR),
+				 *      输出即 VARCHAR, 整行必走文本回退 — 单一事实源
+				 *      duckdb_pg_type_native_chunk(), 禁止再写第二份清单;
+				 *  (b) E3 残角: INT2/FLOAT4 在共享定宽集合内, deparse 裸
+				 *      输出, 但 DuckDB 侧物理宽度可能不符 (如 PG 声明 int2
+				 *      而 DuckDB 实为 INTEGER): 运行期 duckdb_chunk_types_ok
+				 *      拒入快路径, 整行拖进文本回退, 同投影的裸 TZ 列在文本
+				 *      路径读成 NULL。计划期不可预知 → 保守: 同投影存在任一
+				 *      INT2/FLOAT4 列即强制 TZ cast。代价: 窄整数列+TZ 同投影
+				 *      且宽度恰好规范时, TZ 也多一次远端 cast (正确性优先,
+				 *      可接受)。
+				 */
+				if (!duckdb_pg_type_native_chunk(ca->atttypid) ||
+					ca->atttypid == INT2OID ||
+					ca->atttypid == FLOAT4OID)
+				{
+					need_tz_cast = true;
+					break;
+				}
+				}
+			}
+
+			if (duckdb_pg_type_native_chunk(attr->atttypid) &&
+				(attr->atttypid != TIMESTAMPTZOID || !need_tz_cast))
+			{
+				/* 定宽列(单一事实源 duckdb_pg_type_native_chunk): C API 可直接读 */
+				duckdb_deparse_column_ref(buf, rtindex, i, root, qualify_col);
+			}
+			else if (getBaseType(attr->atttypid) == BYTEAOID)
+			{
+				/* DuckDB's BLOB text format differs from PostgreSQL bytea. */
+				appendStringInfoString(buf, "('\\x' || hex(");
+				duckdb_deparse_column_ref(buf, rtindex, i, root, qualify_col);
+				appendStringInfoString(buf, "))");
+			}
+			else if (duckdb_fdw_oid_is_geometry(attr->atttypid) ||
+					 duckdb_fdw_oid_is_geometry(getBaseType(attr->atttypid)))
+			{
+				/*
+				 * Keep native DuckDB GEOMETRY so duckdb_value_blob() can
+				 * read WKB. CAST(... AS VARCHAR) segfaults on GEOMETRY.
+				 */
+				duckdb_deparse_column_ref(buf, rtindex, i, root, qualify_col);
+			}
+			else
+			{
+				/* 复杂列, 或文本回退下的 TIMESTAMPTZ: 强制序列化 */
+				appendStringInfoString(buf, "CAST(");
+				duckdb_deparse_column_ref(buf, rtindex, i, root, qualify_col);
+				appendStringInfoString(buf, " AS VARCHAR)");
+			}
 
 			if (check_null)
 				appendStringInfoString(buf, " IS NOT NULL) ");

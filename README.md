@@ -8,7 +8,7 @@
 
 ---
 
-## 🚀 Capability Status (v2.0.1)
+## 🚀 Capability Status (v2.0.2)
 
 | Capability | Status | Validation Evidence | Prerequisites |
 | :--- | :--- | :--- | :--- |
@@ -25,6 +25,30 @@
 | PostGIS GEOMETRY mapping | Implemented | `duckdb_fdw_geom.c`; `requires = postgis`; IMPORT + `duckdb_value_blob` scan | PostGIS (`CREATE EXTENSION postgis`) |
 | Iceberg/S3 examples | Partial | `examples/07-13` | Network, optional credentials |
 | Full Arrow C Data scan path | Planned | no `duckdb_query_arrow` call in active scan path; tracked as future work | future release |
+
+## Transactions and subtransactions
+
+INSERTs on a connection share one DuckDB transaction. An idle
+connection can start this transaction in either a top-level PostgreSQL
+transaction or a subtransaction. The PostgreSQL level that starts it owns the
+whole remote transaction. Owner rollback discards its remote changes; successful
+subtransaction completion transfers ownership to the parent until the outer
+transaction commits or rolls back.
+
+Only the owning level can access an active remote transaction. Descendants are
+rejected before remote access, including reads, writes, metadata queries, and
+cursor fetches that resume a foreign scan. PostgreSQL can still return rows
+already materialized locally. After a child releases its transaction to the
+parent, a sibling therefore cannot access that connection. Other idle
+connections remain available to the child. A purely local descendant error leaves the ancestor's remote
+transaction usable. Remote errors propagate to PostgreSQL; owner abort cleans
+remote resources and rolls back the whole DuckDB transaction, allowing retry.
+
+`duckdb_execute` runs arbitrary SQL only while the connection has no FDW-managed
+transaction. This keeps transaction-control SQL from committing or rolling back
+managed writes. PREPARE TRANSACTION is rejected while a DuckDB transaction is
+active. Remote commit errors are reported before PostgreSQL commits. PostgreSQL
+and DuckDB use separate transactions, without two-phase atomicity.
 
 ## 🧪 Test Profiles
 
@@ -63,11 +87,31 @@ make
 sudo make install
 ```
 
+### Quick Build (Windows)
+
+On Windows, `duckdb_fdw` is built as a DLL with CMake and MSVC (Visual Studio 2022 or the Build Tools), against the PostgreSQL installation from the EDB installer.
+
+```powershell
+# 1. Download DuckDB headers, duckdb.lib and duckdb.dll
+.\download_libduckdb.ps1
+
+# 2. Configure and build (PG_PATH defaults to C:\Program Files\PostgreSQL\18;
+#    it can also be passed as the PG_PATH environment variable)
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DPG_PATH="C:\Program Files\PostgreSQL\18"
+cmake --build build --config Release
+
+# 3. Install into PostgreSQL (run as Administrator), then restart the service
+.\install_duckdb_fdw.ps1 -PostgresBase "C:\Program Files\PostgreSQL\18"
+```
+
+The installer copies `duckdb_fdw.dll` into `<PostgresBase>\lib`, `duckdb_fdw.control` and `duckdb_fdw--*.sql` into `<PostgresBase>\share\extension`, and `duckdb.dll` into `<PostgresBase>\bin` so that the PostgreSQL server can load it.
+
 ### Requirements
 * PostgreSQL 13 - 18 (headers required)
 * **PostGIS** (this fork always requires it — `duckdb_fdw.control` has `requires = 'postgis'`). Install the extension package (`postgresql-<major>-postgis-3` on Debian/Ubuntu). Do **not** link `liblwgeom` into duckdb_fdw: that library parses WKB in C, but the Postgres `geometry` type is registered by `postgis.so`.
-* DuckDB library (`libduckdb.so` or `libduckdb.dylib`) with repo-pinned bootstrap default `1.5.5`
-* GCC or Clang with C11/C++11 support
+* DuckDB library (`libduckdb.so`, `libduckdb.dylib` or `duckdb.dll`) with repo-pinned bootstrap default `1.5.5`
+* Tested with libduckdb 1.5.x **and 2.0.x** (FDW asserts version range `1.5.x / 2.0.x` on first connection and fails startup with a clear error outside it)
+* GCC or Clang with C11/C++11 support (MSVC + CMake >= 3.20 on Windows)
 
 ## 🛠️ Usage
 
@@ -85,6 +129,18 @@ OPTIONS (database '/tmp/duckdb_fdw_demo.db');
 `CREATE EXTENSION duckdb_fdw` fails if PostGIS is not installed. Postgres's own error is generic (`required extension "postgis" is not installed`); IMPORT/scan also emit a hint to run `CREATE EXTENSION postgis WITH SCHEMA extensions;` (Geobase) or `CREATE EXTENSION postgis;`.
 
 `database ':memory:'` is a connection-scoped temporary database. `duckdb_fdw` now refreshes cached connections at transaction end, so if you create tables or views with `duckdb_execute(...)` and then read them through foreign tables in later SQL statements, use a file-backed DuckDB database by default. If you intentionally want `:memory:`, wrap the entire modeling and query sequence in the same explicit transaction.
+
+Connection reuse across transactions: `SET duckdb_fdw.keep_connection = on` (off by default, session-scoped) makes the transaction-end callback *retain* cached DuckDB connections after `COMMIT` (the remote transaction is settled first) and tear them down only on `ABORT`, so the next transaction reuses the connection instead of re-opening the database, re-installing extensions and re-`ATTACH`ing catalogs.
+
+> **File-backed databases + multiple sessions:** a retained connection keeps the
+> file write lock held **for as long as the session lives**. While session A holds
+> it, every *other* session that touches the same file gets a clean `failed to open
+> DuckDB` error on its next query (measured on v2.0.1, libduckdb 1.5.6 — the failure
+> is a lock contention, not a crash, and recovers as soon as A releases). This is
+> DuckDB's single-writer file model, not an FDW bug. Enable the GUC per session only
+> where reuse wins over exclusive lock holding, and never across a fleet of
+> concurrent sessions against one file — the gain is largest for quack/remote mode,
+> where the lock is on the remote side, not a shared local file.
 
 ### 2. `pg_duckdb` Coexistence Policy
 
@@ -144,6 +200,19 @@ CREATE SERVER s3_srv FOREIGN DATA WRAPPER duckdb_fdw OPTIONS (
     s3_region 'us-east-1',
     s3_access_key_id 'YOUR_KEY',
     s3_secret_access_key 'YOUR_SECRET'
+);
+```
+
+#### S3-Compatible Endpoints (URL Style)
+
+Some S3-compatible object stores (MinIO, Ceph, ...) require path-style addressing. Use `s3_url_style` (`path` or `vhost`) to set the `URL_STYLE` of the generated S3 secret:
+
+```sql
+CREATE SERVER minio_srv FOREIGN DATA WRAPPER duckdb_fdw OPTIONS (
+    database '/tmp/s3_cache.db',
+    s3_region 'us-east-1',
+    s3_endpoint 'minio.local:9000',
+    s3_url_style 'path'
 );
 ```
 
@@ -264,6 +333,14 @@ OPTIONS (quack_host '192.168.1.10:9494');
 CREATE USER MAPPING FOR current_user SERVER quack_srv
 OPTIONS (quack_token 'shared_secret');
 
+-- TLS (default for non-local hosts): the server uses a self-signed
+-- certificate, so pin its SHA-256 fingerprint, shown on the server by
+--   SELECT info['ssl_fingerprint'] FROM quack_server_list();
+-- ALTER SERVER quack_srv OPTIONS (ADD ssl_fingerprint '43:70:A0:...:F4:52');
+
+-- Server started with quack_serve(..., disable_ssl => true): plain HTTP
+-- ALTER SERVER quack_srv OPTIONS (ADD disable_ssl 'true');
+
 -- One command: import all remote tables
 IMPORT FOREIGN SCHEMA main FROM SERVER quack_srv INTO public;
 
@@ -333,6 +410,25 @@ SELECT duckdb_execute('duckdb_srv', 'INSTALL spatial; LOAD spatial;');
 ```
 
 Result messages containing credentials (SECRET, KEY_ID, ACCESS_KEY, TOKEN, motherduck) are automatically redacted in error output for security.
+
+#### Per-connection initialization (`init_sql`)
+
+To run DuckDB SQL on **every** new connection (load extensions, set options, attach extra catalogs...), use the `init_sql` server option. It runs after secrets, extensions and `attach_catalogs` have been set up:
+
+```sql
+CREATE SERVER duckdb_srv FOREIGN DATA WRAPPER duckdb_fdw OPTIONS (
+    database '/tmp/analytics.db',
+    init_sql $$ LOAD spatial; SET threads = 4; $$
+);
+```
+
+#### Importing tables and views
+
+`IMPORT FOREIGN SCHEMA` creates a foreign table for every table **and view** in the remote schema (`duckdb_tables()` + non-internal `duckdb_views()`):
+
+```sql
+IMPORT FOREIGN SCHEMA main FROM SERVER duckdb_srv INTO public;
+```
 
 ## 📉 Feature Comparison
 

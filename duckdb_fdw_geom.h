@@ -45,4 +45,7 @@ extern bool duckdb_fdw_convert_blob_column(duckdb_result *res, int col_idx,
 										   uint64_t row, Oid pgtype,
 										   Datum *out);
 
+/* True when pgtype is PostGIS geometry (any schema). */
+extern bool duckdb_fdw_oid_is_geometry(Oid pgtype);
+
 #endif

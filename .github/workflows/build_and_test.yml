@@ -27,7 +27,7 @@ jobs:
             pg_version: 17
           - os: macos-14
             arch: arm64
-            pg_version: 16
+            pg_version: 17
 
     steps:
     - uses: actions/checkout@v4
@@ -46,54 +46,38 @@ jobs:
         sudo apt-get update
         # postgis is a hard dependency (duckdb_fdw.control requires = postgis).
         # GEOMETRY has no bytea fallback; fail the job if this package is missing.
-        sudo apt-get install -y postgresql-${PG_MAJOR} postgresql-client-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR} postgresql-${PG_MAJOR}-postgis-3 curl unzip build-essential
+        sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-client-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }} postgresql-${{ matrix.pg_version }}-postgis-3 curl unzip build-essential
 
-        # Prefer the matrix major for pg_config/psql/pg_isready
-        echo "${PG_BIN}" >> "$GITHUB_PATH"
-        export PATH="${PG_BIN}:$PATH"
+        # The runner image ships a preinstalled PostgreSQL whose pg_config
+        # shadows the pgdg one in PATH. Pin every build/test command to the
+        # matrix version explicitly.
+        echo "/usr/lib/postgresql/${{ matrix.pg_version }}/bin" >> $GITHUB_PATH
+        hash -r
+        /usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config --version
 
-        # Stop non-matrix clusters so port 5432 is unambiguous
-        if command -v pg_lsclusters >/dev/null 2>&1; then
-          while read -r ver name port status rest; do
-            case "$ver" in
-              Ver|"") continue ;;
-            esac
-            if [ "$ver" != "$PG_MAJOR" ]; then
-              sudo pg_ctlcluster "$ver" "$name" stop || true
-            fi
-          done < <(pg_lsclusters)
-        fi
-
-        # Ensure the matrix cluster exists and listens on 5432 with password auth
-        if ! pg_lsclusters | awk -v v="$PG_MAJOR" '$1 == v && $2 == "main" { found=1 } END { exit !found }'; then
-          sudo pg_createcluster "$PG_MAJOR" main --port=5432
-        fi
-        CONF="/etc/postgresql/${PG_MAJOR}/main/postgresql.conf"
-        HBA="/etc/postgresql/${PG_MAJOR}/main/pg_hba.conf"
-        sudo sed -i "s/^#\?port\s*=.*/port = 5432/" "$CONF"
-        if ! sudo grep -qE '^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+127\.0\.0\.1/32[[:space:]]+md5' "$HBA"; then
-          echo 'host all all 127.0.0.1/32 md5' | sudo tee -a "$HBA" >/dev/null
-        fi
-        if ! sudo grep -qE '^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+::1/128[[:space:]]+md5' "$HBA"; then
-          echo 'host all all ::1/128 md5' | sudo tee -a "$HBA" >/dev/null
-        fi
-        sudo pg_ctlcluster "$PG_MAJOR" main restart || sudo pg_ctlcluster "$PG_MAJOR" main start
-
+        # The pgdg postinst does NOT create a cluster on GitHub runners
+        # (policy-rcd blocks it), and the image's preinstalled cluster owns
+        # 5432. Build our own cluster from scratch: stop everything, initdb,
+        # start ours on 5432.
+        PGBIN=/usr/lib/postgresql/${{ matrix.pg_version }}/bin
+        sudo service postgresql stop || true
+        sudo pkill -u postgres || true
+        sleep 1
+        sudo rm -rf /tmp/pgdata
+        sudo mkdir -p /tmp/pgdata && sudo chown postgres:postgres /tmp/pgdata
+        sudo -u postgres $PGBIN/initdb -D /tmp/pgdata -E UTF8 --auth-local=trust --auth-host=trust
+        # listen on localhost TCP so PGHOST=localhost works
+        echo "listen_addresses = 'localhost'" | sudo tee -a /tmp/pgdata/postgresql.conf
+        sudo -u postgres $PGBIN/pg_ctl -D /tmp/pgdata -l /tmp/pg.log -o "-p 5432" start
         for i in $(seq 1 30); do
-          pg_isready -h localhost -p 5432 && break
+          if $PGBIN/pg_isready -h localhost -p 5432 -q; then break; fi
           sleep 1
         done
-        pg_isready -h localhost -p 5432
+        $PGBIN/pg_isready -h localhost -p 5432
 
-        sudo -u postgres "${PG_BIN}/psql" -c "ALTER USER postgres PASSWORD 'postgres';"
-        sudo -u postgres "${PG_BIN}/psql" -tc "SELECT 1 FROM pg_database WHERE datname = 'postgres'" | grep -q 1 \
-          || sudo -u postgres "${PG_BIN}/createdb" -O postgres postgres
+        sudo -u postgres $PGBIN/psql -h localhost -c "ALTER USER postgres PASSWORD 'postgres';"
         # requires = postgis: create the extension before any CREATE EXTENSION duckdb_fdw.
-        sudo -u postgres "${PG_BIN}/psql" -d postgres -c "CREATE EXTENSION IF NOT EXISTS postgis;"
-
-        echo "Active clusters:"
-        pg_lsclusters
-        echo "pg_config: $(command -v pg_config) ($(pg_config --version))"
+        sudo -u postgres $PGBIN/psql -h localhost -d postgres -c "CREATE EXTENSION IF NOT EXISTS postgis;"
 
     # --- macOS Setup ---
 
@@ -163,6 +147,9 @@ jobs:
         PGDATABASE: postgres
         PGHOST: localhost
         PGPORT: 5432
+        # psql otherwise defaults the database to the OS username ("runner"),
+        # which does not exist — the cluster only has the default DBs.
+        PGDATABASE: postgres
         TEST_PROFILE: ${{ github.event.inputs.test_profile || 'core' }}
       run: |
         if [ "$RUNNER_OS" == "Windows" ]; then
@@ -173,8 +160,9 @@ jobs:
         # macOS specific overrides (peer auth as the runner user)
         if [ "$RUNNER_OS" == "macOS" ]; then
            export PGUSER=$(whoami)
+           export PGPASSWORD=""
            export PGHOST="/tmp"
-           export PGDATABASE="${PGDATABASE:-postgres}"
+           export PGDATABASE=postgres
            unset PGPASSWORD
            createdb "$PGDATABASE" 2>/dev/null || true
            psql -h "$PGHOST" -d "$PGDATABASE" -c "CREATE EXTENSION IF NOT EXISTS postgis;"
@@ -196,3 +184,96 @@ jobs:
         fi
 
         ./run_tests.sh --profile "$TEST_PROFILE"
+
+  # --- DuckDB 2.0.x engine CI target (issue #77) ---
+  # Same build + test as `test`, but the download step pulls the 2.0.0
+  # shared-lib artifacts (download_libduckdb.sh selects them from
+  # DUCKDB_VERSION). The runtime guard accepts 1.5.x / 2.0.x. Separate job
+  # (not a matrix include) because a matrix include with an os+pg_version
+  # that already exists MERGES into that row and would convert the default
+  # 1.5.1 run into a 2.0.0 run instead of adding 2.0.0 coverage alongside.
+  test-duckdb20:
+    name: Test DuckDB 2.0.0 on ${{ matrix.os }} (PG17)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    env:
+      DUCKDB_VERSION: "2.0.0"
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+        wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+        sudo apt-get update
+        sudo apt-get install -y postgresql-17 postgresql-client-17 postgresql-server-dev-17 postgresql-17-postgis-3 curl unzip build-essential
+        echo "/usr/lib/postgresql/17/bin" >> $GITHUB_PATH
+        hash -r
+        /usr/lib/postgresql/17/bin/pg_config --version
+        PGBIN=/usr/lib/postgresql/17/bin
+        sudo service postgresql stop || true
+        sudo pkill -u postgres || true
+        sleep 1
+        sudo rm -rf /tmp/pgdata
+        sudo mkdir -p /tmp/pgdata && sudo chown postgres:postgres /tmp/pgdata
+        sudo -u postgres $PGBIN/initdb -D /tmp/pgdata -E UTF8 --auth-local=trust --auth-host=trust
+        echo "listen_addresses = 'localhost'" | sudo tee -a /tmp/pgdata/postgresql.conf
+        sudo -u postgres $PGBIN/pg_ctl -D /tmp/pgdata -l /tmp/pg.log -o "-p 5432" start
+        for i in $(seq 1 30); do
+          if $PGBIN/pg_isready -h localhost -p 5432 -q; then break; fi
+          sleep 1
+        done
+        $PGBIN/pg_isready -h localhost -p 5432
+        sudo -u postgres $PGBIN/psql -h localhost -c "ALTER USER postgres PASSWORD 'postgres';"
+        sudo -u postgres $PGBIN/psql -h localhost -d postgres -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+
+    - name: Install Dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        brew install postgresql@17
+        brew install postgis
+        brew services start postgresql@17
+        echo "/usr/local/opt/postgresql@17/bin" >> $GITHUB_PATH
+        echo "/opt/homebrew/opt/postgresql@17/bin" >> $GITHUB_PATH
+        sleep 5
+        createdb postgres || true
+        psql -d postgres -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+
+    - name: Download libduckdb ${{ env.DUCKDB_VERSION }} (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: ./download_libduckdb.sh
+
+    - name: Build and Install
+      shell: bash
+      run: |
+        make USE_PGXS=1
+        sudo make USE_PGXS=1 install || make USE_PGXS=1 install
+
+    - name: Run Tests
+      shell: bash
+      env:
+        PGPASSWORD: postgres
+        PGUSER: postgres
+        PGHOST: localhost
+        PGPORT: 5432
+        PGDATABASE: postgres
+      run: |
+        if [ "$RUNNER_OS" == "macOS" ]; then
+           export PGUSER=$(whoami)
+           export PGPASSWORD=""
+           export PGHOST="/tmp"
+           export PGDATABASE=postgres
+           unset PGPASSWORD
+           createdb "$PGDATABASE" 2>/dev/null || true
+           psql -h "$PGHOST" -d "$PGDATABASE" -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+        fi
+        if [ "$RUNNER_OS" == "Linux" ]; then
+           export PATH="/usr/lib/postgresql/17/bin:$PATH"
+           psql -h localhost -d postgres -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+        fi
+        ./run_tests.sh --profile "core"

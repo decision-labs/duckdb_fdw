@@ -2,6 +2,7 @@
 #include "duckdb_fdw.h"
 #include "duckdb_fdw_geom.h"
 #include "access/xact.h"
+#include "common/int.h"
 #include "executor/spi.h"
 #include "utils/uuid.h"
 #include "utils/numeric.h"
@@ -9,14 +10,18 @@
 #include "foreign/fdwapi.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
+#include "catalog/pg_collation.h"
 #include "optimizer/planmain.h"
 #include "utils/memutils.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "catalog/pg_type.h"
 #include "optimizer/clauses.h"
+#include "optimizer/tlist.h"
 #include "optimizer/restrictinfo.h"
 #include "utils/date.h"
+#include "utils/datetime.h"
 #include "utils/guc.h"
 #include "utils/json.h"
 #include "utils/fmgrprotos.h"
@@ -28,23 +33,139 @@
 #include "executor/executor.h"
 #include "commands/explain.h"
 #if PG_VERSION_NUM >= 180000
-/* PG18 split ExplainState / ExplainProperty* out of explain.h */
-#include "commands/explain_state.h"
-#include "commands/explain_format.h"
+#include "commands/explain_state.h" /* PG18: ExplainState moved out of explain.h */
+#include "commands/explain_format.h" /* PG18: ExplainPropertyText moved here */
+#endif
+#include "commands/defrem.h"
+#if PG_VERSION_NUM >= 160000
+#include "varatt.h"
+#else
+#include "utils/varlena.h" /* PG15: varatt.h was split out of varlena.h in PG16 */
 #endif
 #include "nodes/nodeFuncs.h"
+#include "nodes/makefuncs.h"
+#include <ctype.h>
+
+#if PG_VERSION_NUM >= 180000
+#include "access/cmptype.h" /* COMPARE_LT / COMPARE_GT: PG18 PathKey->pk_cmptype */
+#endif
 
 PG_MODULE_MAGIC;
 
 #define DUCKDB_EPOCH_DIFF_DAYS 10957
 #define DUCKDB_EPOCH_DIFF_MICROS INT64CONST(946684800000000)
 
+/*
+ * ------------------------------------------------------------------------
+ * Planner path-creation API portability (PG15 .. PG18)
+ *
+ * The signatures of create_foreignscan_path() / create_foreign_join_path() /
+ * create_foreign_upper_path() changed three times across the supported
+ * releases (see src/include/optimizer/pathnode.h of each version):
+ *
+ *  PG15/PG16  scan/join: 10 args, upper: 9 args (no fdw_restrictinfo)
+ *      create_foreignscan_path(root, rel, target, rows,
+ *                              startup_cost, total_cost,
+ *                              pathkeys, required_outer,
+ *                              fdw_outerpath, fdw_private)
+ *  PG17       scan/join: 11 args, upper: 10 args
+ *      same as above, with fdw_restrictinfo inserted before fdw_private
+ *  PG18       scan/join: 12 args, upper: 11 args
+ *      same as PG17, plus a new int "disabled_nodes" argument inserted
+ *      after "rows" (fdw_restrictinfo is *kept*, not removed).  Extensions
+ *      that do not build parameterized foreign paths pass 0, as we do here.
+ *
+ * make_restrictinfo() differs as well: PG15 takes
+ *      (root, clause, is_pushed_down, outerjoin_delayed, pseudoconstant,
+ *       security_level, required_relids, outer_relids, nullable_relids)
+ * (9 args) while PG16+ take
+ *      (root, clause, is_pushed_down, has_clone, is_clone, pseudoconstant,
+ *       security_level, required_relids, incompatible_relids, outer_relids)
+ * (10 args).
+ *
+ * The wrappers below keep a single (PG17-style) argument list at every call
+ * site, so only this block needs to change when a new major version lands.
+ * ------------------------------------------------------------------------
+ */
+#if PG_VERSION_NUM < 170000			/* PG15/PG16: no fdw_restrictinfo arg */
+#define duckdb_create_foreignscan_path(root, rel, target, rows, sc, tc, \
+									   pk, ro, fo, fr, fp) \
+	create_foreignscan_path((root), (rel), (target), (rows), (sc), (tc), \
+							 (pk), (ro), (fo), (fp))
+#define duckdb_create_foreign_join_path(root, rel, target, rows, sc, tc, \
+									    pk, ro, fo, fr, fp) \
+	create_foreign_join_path((root), (rel), (target), (rows), (sc), (tc), \
+							  (pk), (ro), (fo), (fp))
+#define duckdb_create_foreign_upper_path(root, rel, target, rows, sc, tc, \
+									     pk, fo, fr, fp) \
+	create_foreign_upper_path((root), (rel), (target), (rows), (sc), (tc), \
+							   (pk), (fo), (fp))
+#elif PG_VERSION_NUM < 180000			/* PG17: identity mapping */
+#define duckdb_create_foreignscan_path(root, rel, target, rows, sc, tc, \
+									   pk, ro, fo, fr, fp) \
+	create_foreignscan_path((root), (rel), (target), (rows), (sc), (tc), \
+							 (pk), (ro), (fo), (fr), (fp))
+#define duckdb_create_foreign_join_path(root, rel, target, rows, sc, tc, \
+									    pk, ro, fo, fr, fp) \
+	create_foreign_join_path((root), (rel), (target), (rows), (sc), (tc), \
+							  (pk), (ro), (fo), (fr), (fp))
+#define duckdb_create_foreign_upper_path(root, rel, target, rows, sc, tc, \
+									     pk, fo, fr, fp) \
+	create_foreign_upper_path((root), (rel), (target), (rows), (sc), (tc), \
+							   (pk), (fo), (fr), (fp))
+#else							/* PG18: +disabled_nodes after rows */
+#define duckdb_create_foreignscan_path(root, rel, target, rows, sc, tc, \
+									   pk, ro, fo, fr, fp) \
+	create_foreignscan_path((root), (rel), (target), (rows), 0, (sc), (tc), \
+							 (pk), (ro), (fo), (fr), (fp))
+#define duckdb_create_foreign_join_path(root, rel, target, rows, sc, tc, \
+									    pk, ro, fo, fr, fp) \
+	create_foreign_join_path((root), (rel), (target), (rows), 0, (sc), (tc), \
+							  (pk), (ro), (fo), (fr), (fp))
+#define duckdb_create_foreign_upper_path(root, rel, target, rows, sc, tc, \
+									     pk, fo, fr, fp) \
+	create_foreign_upper_path((root), (rel), (target), (rows), 0, (sc), (tc), \
+							   (pk), (fo), (fr), (fp))
+#endif
+
+#if PG_VERSION_NUM < 160000			/* PG15: outerjoin_delayed-era signature */
+#define duckdb_make_restrictinfo(root, clause, pushed, hcl, cl, pseudo, \
+								 lvl, req, inc, outer) \
+	make_restrictinfo((root), (clause), (pushed), (false), (pseudo), \
+						 (lvl), (req), (outer), (NULL))
+#else								/* PG16+ */
+#define duckdb_make_restrictinfo(root, clause, pushed, hcl, cl, pseudo, \
+								 lvl, req, inc, outer) \
+	make_restrictinfo((root), (clause), (pushed), (hcl), (cl), (pseudo), \
+						 (lvl), (req), (inc), (outer))
+#endif
+
 bool duckdb_fdw_allow_unsupported_pg_duckdb_coexistence = false;
 
+/*
+ * E1: duckdb_fdw.keep_connection (PGC_USERSET, default off).
+ * Off (default): the xact callback tears the connection cache down at every
+ * top-level transaction end (COMMIT and ABORT alike) — historical behavior.
+ * On: after COMMIT the remote transaction is settled and the cached
+ * connections are *retained*, so the next transaction reuses the handles
+ * instead of re-opening the database, re-installing extensions and
+ * re-ATTACHing catalogs.  ABORT always tears the cache down (remote
+ * ROLLBACK first), so a half-open remote state is never handed on.  Defined
+ * here, registered in _PG_init, consumed by the xact callback in
+ * connection.c (extern there).
+ */
+bool duckdb_fdw_keep_connection = false;
+
+static void duckdb_cleanup_scan(void *arg);
+static void duckdb_cleanup_modify(void *arg);
+static void duckdb_finish_modify(void *arg);
+
 static void duckdb_estimate_path_cost_size(PlannerInfo *root, RelOptInfo *foreignrel,
-										   List *param_join_conds, List *pathkeys,
-										   void *fpextra, double *p_rows, int *p_width,
-										   Cost *p_startup_cost, Cost *p_total_cost);
+					   List *param_join_conds, List *pathkeys,
+					   void *fpextra, double *p_rows, int *p_width,
+					   Cost *p_startup_cost, Cost *p_total_cost);
+static bool duckdb_chunk_types_ok(duckdb_result *res, TupleDesc tupdesc,
+								  List *retrieved_attrs);
 static bool duckdb_fdw_check_unsupported_pg_duckdb_coexistence(bool *newval,
 															   void **extra,
 															   GucSource source);
@@ -54,8 +175,12 @@ static void duckdb_jsonb_append_string_field(StringInfo buf, const char *key,
 static void duckdb_jsonb_append_bool_field(StringInfo buf, const char *key,
 										   bool value, bool *first_field);
 static void duckdb_fdw_preflight_probe(bool *installed_in_database,
-									   bool *available_in_instance,
-									   bool *catalog_lookup_ok);
+                                       bool *available_in_instance,
+                                       bool *catalog_lookup_ok);
+static bool duckdb_pathkeys_all_foreign(PlannerInfo *root, RelOptInfo *rel,
+                                        List *pathkeys);
+static void duckdb_add_presorted_foreign_paths(PlannerInfo *root,
+                                               RelOptInfo *rel);
 
 static char *
 duckdb_build_relation_reference(const char *table_name)
@@ -90,8 +215,36 @@ duckdb_build_relation_reference(const char *table_name)
 	return duckdb_fdw_quote_identifier(table_name);
 }
 
+static duckdb_date
+duckdb_date_from_pg(DateADT value)
+{
+	duckdb_date date;
+
+	if (DATE_NOT_FINITE(value))
+		date.days = DATE_IS_NOBEGIN(value) ? -PG_INT32_MAX : PG_INT32_MAX;
+	else
+		date.days = value + DUCKDB_EPOCH_DIFF_DAYS;
+	return date;
+}
+
+
+static duckdb_timestamp
+duckdb_timestamp_from_pg(Timestamp value)
+{
+	duckdb_timestamp ts;
+
+	if (TIMESTAMP_NOT_FINITE(value))
+		ts.micros = TIMESTAMP_IS_NOBEGIN(value) ? -PG_INT64_MAX : PG_INT64_MAX;
+	else if (pg_add_s64_overflow(value, DUCKDB_EPOCH_DIFF_MICROS, &ts.micros) ||
+			 ts.micros == PG_INT64_MAX)
+		ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						errmsg("timestamp is out of range for DuckDB")));
+	return ts;
+}
+
+
 static void
-duckdb_bind_parameter(duckdb_prepared_statement stmt, idx_t param_idx, Oid typid, Datum val, bool isnull)
+duckdb_bind_parameter_value(duckdb_prepared_statement stmt, idx_t param_idx, Oid typid, Datum val, bool isnull)
 {
 	Oid			typoutput;
 	bool		typisvarlena;
@@ -132,18 +285,35 @@ duckdb_bind_parameter(duckdb_prepared_statement stmt, idx_t param_idx, Oid typid
 			return;
 		case DATEOID:
 			{
-				duckdb_date date = {DatumGetDateADT(val) + DUCKDB_EPOCH_DIFF_DAYS};
+				duckdb_date date = duckdb_date_from_pg(DatumGetDateADT(val));
+
 				if (duckdb_bind_date(stmt, param_idx, date) == DuckDBError)
 					elog(ERROR, "duckdb_fdw: bind date failed at parameter %zu", (size_t) param_idx);
 				return;
 			}
 		case TIMESTAMPOID:
-		case TIMESTAMPTZOID:
 			{
-				duckdb_timestamp ts;
-				ts.micros = DatumGetInt64(val) + DUCKDB_EPOCH_DIFF_MICROS;
+				duckdb_timestamp ts = duckdb_timestamp_from_pg(DatumGetTimestamp(val));
+
 				if (duckdb_bind_timestamp(stmt, param_idx, ts) == DuckDBError)
 					elog(ERROR, "duckdb_fdw: bind timestamp failed at parameter %zu", (size_t) param_idx);
+				return;
+			}
+		case TIMESTAMPTZOID:
+			{
+				duckdb_timestamp ts = duckdb_timestamp_from_pg(DatumGetTimestampTz(val));
+
+				if (duckdb_bind_timestamp_tz(stmt, param_idx, ts) == DuckDBError)
+					elog(ERROR, "duckdb_fdw: bind timestamptz failed at parameter %zu", (size_t) param_idx);
+				return;
+			}
+		case BYTEAOID:
+			{
+				bytea	   *bytes = DatumGetByteaPP(val);
+
+				if (duckdb_bind_blob(stmt, param_idx, VARDATA_ANY(bytes),
+									 VARSIZE_ANY_EXHDR(bytes)) == DuckDBError)
+					elog(ERROR, "duckdb_fdw: bind bytea failed at parameter %zu", (size_t) param_idx);
 				return;
 			}
 		default:
@@ -160,6 +330,22 @@ duckdb_bind_parameter(duckdb_prepared_statement stmt, idx_t param_idx, Oid typid
 }
 
 static void
+duckdb_bind_parameter(duckdb_connection conn, duckdb_prepared_statement stmt,
+					  idx_t param, Oid type, Datum value, bool isnull)
+{
+	PG_TRY();
+	{
+		duckdb_bind_parameter_value(stmt, param, type, value, isnull);
+	}
+	PG_CATCH();
+	{
+		duckdb_mark_xact_failed(conn);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+static void
 duckdb_execute_query(DuckDBFdwExecState *festate, ForeignScanState *node, ForeignScan *fsplan)
 {
 	if (fsplan->fdw_exprs != NIL)
@@ -171,7 +357,7 @@ duckdb_execute_query(DuckDBFdwExecState *festate, ForeignScanState *node, Foreig
 		festate->param_exprs = fsplan->fdw_exprs;
 		festate->param_expr_states = ExecInitExprList(fsplan->fdw_exprs, &node->ss.ps);
 
-		if (duckdb_prepare(festate->conn, festate->query, &festate->prepared_stmt) == DuckDBError)
+		if (duckdb_prepare_checked(festate->conn, festate->query, &festate->prepared_stmt) == DuckDBError)
 		{
 			const char *err = festate->prepared_stmt ? duckdb_prepare_error(festate->prepared_stmt) : "prepare error";
 			char *err_msg = pstrdup(err ? err : "prepare error");
@@ -179,8 +365,6 @@ duckdb_execute_query(DuckDBFdwExecState *festate, ForeignScanState *node, Foreig
 				duckdb_destroy_prepare(&festate->prepared_stmt);
 			elog(ERROR, "duckdb_fdw: prepare failed: %s", err_msg);
 		}
-
-		festate->use_prepared_stmt = true;
 
 		forboth(lc_state, festate->param_expr_states, lc_expr, festate->param_exprs)
 		{
@@ -192,19 +376,32 @@ duckdb_execute_query(DuckDBFdwExecState *festate, ForeignScanState *node, Foreig
 
 			val = ExecEvalExpr(estate, node->ss.ps.ps_ExprContext, &isnull);
 			typid = exprType((Node *) expr);
-			duckdb_bind_parameter(festate->prepared_stmt, param_idx, typid, val, isnull);
+			duckdb_bind_parameter(festate->conn, festate->prepared_stmt, param_idx, typid, val, isnull);
 			param_idx++;
 		}
 
-		if (duckdb_execute_prepared(festate->prepared_stmt, &festate->res) == DuckDBError)
-			elog(ERROR, "duckdb_fdw: execute prepared failed");
+		if (duckdb_execute_checked(festate->conn, festate->prepared_stmt, &festate->res) == DuckDBError)
+		{
+			/*
+			 * On failure query_executed is still false, so EndForeignScan
+			 * will skip destroying the result.  The error text is owned by
+			 * the result: copy it, destroy the result, then elog (longjmp).
+			 */
+			const char *errtxt = pstrdup(duckdb_result_error(&festate->res));
+			duckdb_destroy_result(&festate->res);
+			elog(ERROR, "duckdb_fdw: execute prepared failed: %s", errtxt);
+		}
 	}
 	else
 	{
-		if (duckdb_query(festate->conn, festate->query, &festate->res) == DuckDBError)
-			elog(ERROR, "duckdb_fdw: query failed: %s", duckdb_result_error(&festate->res));
-		festate->use_prepared_stmt = false;
+		if (duckdb_query_checked(festate->conn, festate->query, &festate->res) == DuckDBError)
+		{
+			const char *errtxt = pstrdup(duckdb_result_error(&festate->res));
+			duckdb_destroy_result(&festate->res);
+			elog(ERROR, "duckdb_fdw: query failed: %s", errtxt);
+		}
 	}
+	festate->query_executed = true;
 }
 
 static bool
@@ -225,6 +422,147 @@ duckdb_fetch_next_chunk(DuckDBFdwExecState *festate)
 	return festate->current_chunk_row_count > 0;
 }
 
+/*
+ * duckdb_pg_type_native_chunk
+ *  Single source of truth for "this PG column type has a native fixed-width
+ *  physical layout that both sides can trust":
+ *   - the deparser (duckdb_deparse_target_list) uses it to decide whether
+ *     the remote SELECT emits the column bare or wrapped in
+ *     CAST(... AS VARCHAR) (the latter forces the per-value text fallback);
+ *   - the chunk fast path (duckdb_can_use_chunk_scan) uses it as the
+ *     plan-time gate before reading vectors with a fixed stride.
+ *  The exact runtime physical width is still enforced separately by
+ *  duckdb_chunk_types_ok() on the DuckDB-side column types (double
+ *  insurance: plan-time PG type may pass, the runtime physical width must
+ *  match exactly — DuckDB widens some results, e.g. sum() -> HUGEINT).
+ *  Pure function, no state: do not add per-column special cases here,
+ *  and do not keep hand-written copies of this set elsewhere.
+ */
+bool
+duckdb_pg_type_native_chunk(Oid pgtype)
+{
+	switch (pgtype)
+	{
+		case BOOLOID:
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+		case DATEOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * duckdb_chunk_types_ok
+ *  The fast chunk-scan path in duckdbIterateForeignScan reads each vector
+ *  element as a fixed-width physical value sized by the *Postgres* column
+ *  type (e.g. ((int64_t *) data)[row]).  That is only correct when the
+ *  underlying DuckDB column is stored with exactly that physical width.
+ *
+ *  DuckDB widens some results beyond their Postgres counterpart: notably
+ *  sum(int) / sum(smallint) / sum(tinyint) return HUGEINT (16 bytes), and
+ *  an aggregate over a BIGINT expression can as well.  Reading a 16-byte
+ *  vector with an 8-byte stride walks the high 64 bits on alternate rows,
+ *  silently corrupting roughly half the values (e.g. sum columns coming
+ *  back as 0 on odd-indexed rows).
+ *
+ *  When every retrieved column's PG type is native fixed-width per
+ *  duckdb_pg_type_native_chunk() (checked earlier by
+ *  duckdb_can_use_chunk_scan) and its DuckDB type is one of the fixed-width
+ *  physical types the fast path assumes, it is safe to use; otherwise
+ *  (HUGEINT, UBIGINT, DECIMAL, VARCHAR, LIST, ...) fall back to the
+ *  type-correct duckdb_value_to_pg() text path.  The per-type exact-width
+ *  checks below must stay in lockstep with duckdb_pg_type_native_chunk().
+ */
+static bool
+duckdb_chunk_types_ok(duckdb_result *res, TupleDesc tupdesc, List *retrieved_attrs)
+{
+	ListCell   *lc;
+	int			i = 0;
+
+	if (res == NULL || tupdesc == NULL || retrieved_attrs == NIL)
+		return false;
+
+	foreach(lc, retrieved_attrs)
+	{
+		int			attnum_pg = lfirst_int(lc);
+		Oid			pgtype;
+		duckdb_type dt;
+
+		if (attnum_pg <= 0 || attnum_pg > tupdesc->natts)
+			return false;
+
+		pgtype = TupleDescAttr(tupdesc, attnum_pg - 1)->atttypid;
+		dt = duckdb_column_type(res, i);
+
+		switch (pgtype)
+		{
+			case BOOLOID:
+				if (dt != DUCKDB_TYPE_BOOLEAN)
+					return false;
+				break;
+			case INT2OID:
+				/*
+				 * Only a physical 2-byte SMALLINT is safe.  TINYINT is a
+				 * 1-byte type: reading it with a 2-byte stride would
+				 * misalign every following value in the chunk.
+				 */
+				if (dt != DUCKDB_TYPE_SMALLINT)
+					return false;
+				break;
+			case INT4OID:
+				/*
+				 * Only a physical 4-byte INTEGER is safe.  SMALLINT /
+				 * TINYINT are narrower: a 4-byte stride over a 1- or 2-byte
+				 * column reads past the vector into neighbouring data.
+				 */
+				if (dt != DUCKDB_TYPE_INTEGER)
+					return false;
+				break;
+			case INT8OID:
+				/*
+				 * Only a true 8-byte BIGINT is safe.  HUGEINT / UBIGINT /
+				 * UINTEGER are wider or unsigned and must not be read with
+				 * an 8-byte stride.
+				 */
+				if (dt != DUCKDB_TYPE_BIGINT)
+					return false;
+				break;
+			case FLOAT4OID:
+				if (dt != DUCKDB_TYPE_FLOAT)
+					return false;
+				break;
+			case FLOAT8OID:
+				if (dt != DUCKDB_TYPE_DOUBLE)
+					return false;
+				break;
+			case DATEOID:
+				if (dt != DUCKDB_TYPE_DATE)
+					return false;
+				break;
+			case TIMESTAMPOID:
+				if (dt != DUCKDB_TYPE_TIMESTAMP)
+					return false;
+				break;
+			case TIMESTAMPTZOID:
+				if (dt != DUCKDB_TYPE_TIMESTAMP_TZ)
+					return false;
+				break;
+			default:
+				return false;
+		}
+		i++;
+	}
+
+	return true;
+}
+
 static bool
 duckdb_can_use_chunk_scan(TupleDesc tupdesc, List *retrieved_attrs)
 {
@@ -242,23 +580,390 @@ duckdb_can_use_chunk_scan(TupleDesc tupdesc, List *retrieved_attrs)
 			return false;
 
 		pgtype = TupleDescAttr(tupdesc, attnum_pg - 1)->atttypid;
-		switch (pgtype)
+
+		/*
+		 * Plan-time gate: only PG types with a native fixed-width layout may
+		 * use the chunk fast path.  The set is the shared
+		 * duckdb_pg_type_native_chunk() — the same function the deparser
+		 * (duckdb_deparse_target_list) uses to decide whether the remote
+		 * SELECT emits the column bare, so the two lists can no longer drift
+		 * apart.  The exact physical width is still enforced at runtime by
+		 * duckdb_chunk_types_ok(): plan-time PG type may pass, the runtime
+		 * physical width must match exactly (DuckDB widens some results,
+		 * e.g. sum() -> HUGEINT).
+		 */
+		if (!duckdb_pg_type_native_chunk(pgtype))
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * 把 PG 数组输出格式({1,2} / {"a","b"}) 转成 DuckDB list 字面量
+ * ([1,2] / ['a','b'])。DuckDB 的 list 列不认花括号, 只认方括号;
+ * 字符串元素用单引号。已知边界: 元素含引号、多维数组不在覆盖范围
+ * (读路径同样只处理一层花括号), 遇到时原样透传, 由 DuckDB 报错。
+ */
+static char *
+duckdb_pg_array_to_duckdb_list(const char *in)
+{
+	char		*out;
+	size_t		len = strlen(in);
+	char		*p;
+	char		*q;
+	bool		bad = false;
+
+	out = palloc(len + 1);
+	p = in;
+	q = out;
+	while (*p)
+	{
+		if (*p == '{')
+			*q++ = '[';
+		else if (*p == '}')
+			*q++ = ']';
+		else if (*p == '"')
 		{
-			case BOOLOID:
-			case INT2OID:
-			case INT4OID:
-			case INT8OID:
-			case FLOAT4OID:
-			case FLOAT8OID:
-			case DATEOID:
-			case TIMESTAMPOID:
-			case TIMESTAMPTZOID:
-				break;
-			default:
-				return false;
+			if (q != out && q[-1] != '[' && q[-1] != ',')
+				bad = true;
+			*q++ = '\'';
+		}
+		else
+			*q++ = *p;
+		p++;
+	}
+	*q = '\0';
+	if (bad)
+	{
+		pfree(out);
+		return NULL;
+	}
+	return out;
+}
+
+/*
+ * B3: name-based INSERT column mapping.
+ *
+ * The legacy write path appended slot values in PG tuple-descriptor order
+ * and relied on the DuckDB table having the identical column order; a
+ * rename or reorder on either side silently crossed columns (or failed at
+ * row time).  The mapping below is built from DESCRIBE on the target
+ * relation: every PG attribute is matched by name (the column_name FDW
+ * option, or the PG attribute name when the option is absent) against a
+ * DuckDB column.  The appender path then fills columns in *DuckDB* order
+ * (the appender cannot skip columns, so columns DuckDB has but PG does not
+ * receive SQL NULL), and the SQL fallback emits an explicit column list,
+ * so both write paths land in the right columns regardless of either
+ * side's declared order.
+ */
+
+typedef enum DuckFdwWriteMode
+{
+	DUCKFDW_WM_VARCHAR,
+	DUCKFDW_WM_BOOL,
+	DUCKFDW_WM_INT,
+	DUCKFDW_WM_FLOAT,
+	DUCKFDW_WM_DATE,
+	DUCKFDW_WM_TIME,
+	DUCKFDW_WM_TIMESTAMP,
+	DUCKFDW_WM_TIMESTAMPTZ,
+	DUCKFDW_WM_BLOB
+} DuckFdwWriteMode;
+
+/*
+ * Classify a DuckDB column type (the column_type column of DESCRIBE) into
+ * an appender mode.  Types the C appender API has no native add for
+ * (UUID, DECIMAL, HUGEINT, ENUM, STRUCT, LIST, ...) are handled via
+ * VARCHAR: the appender casts the stored value to the column type, and
+ * essentially every scalar DuckDB type is castable from VARCHAR.
+ */
+static DuckFdwWriteMode
+duckdb_fdw_classify_write_type(const char *coltype)
+{
+	const char *p;
+	char		token[64];
+	int			n = 0;
+
+	/* uppercase, drop spaces, cut at the first '(' (e.g. DECIMAL(18,3)) */
+	for (p = coltype; p && *p; p++)
+	{
+		char		c = *p;
+
+		if (c == '(')
+			break;
+		if (c == ' ' || c == '\t')
+			continue;
+		c = (char) toupper((unsigned char) c);
+		if (n < (int) sizeof(token) - 1)
+			token[n++] = c;
+	}
+	token[n] = '\0';
+
+	if (strcmp(token, "BOOLEAN") == 0)
+		return DUCKFDW_WM_BOOL;
+	if (strcmp(token, "TINYINT") == 0 || strcmp(token, "SMALLINT") == 0 ||
+		strcmp(token, "INT") == 0 || strcmp(token, "INT2") == 0 ||
+		strcmp(token, "INT4") == 0 || strcmp(token, "INT8") == 0 ||
+		strcmp(token, "INTEGER") == 0 || strcmp(token, "BIGINT") == 0 ||
+		strcmp(token, "UTINYINT") == 0 || strcmp(token, "USMALLINT") == 0 ||
+		strcmp(token, "UINTEGER") == 0 || strcmp(token, "UBIGINT") == 0)
+		return DUCKFDW_WM_INT;
+	if (strcmp(token, "FLOAT") == 0 || strcmp(token, "REAL") == 0 ||
+		strcmp(token, "FLOAT4") == 0 || strcmp(token, "FLOAT8") == 0 ||
+		strcmp(token, "DOUBLE") == 0 || strcmp(token, "DOUBLEPRECISION") == 0)
+		return DUCKFDW_WM_FLOAT;
+	if (strcmp(token, "DATE") == 0)
+		return DUCKFDW_WM_DATE;
+	if (strcmp(token, "TIME") == 0)
+		return DUCKFDW_WM_TIME;
+	if (strcmp(token, "TIMESTAMP") == 0)
+		return DUCKFDW_WM_TIMESTAMP;
+	if (strcmp(token, "TIMESTAMPTZ") == 0 ||
+		strcmp(token, "TIMESTAMPWITHTIMEZONE") == 0)
+		return DUCKFDW_WM_TIMESTAMPTZ;
+	if (strcmp(token, "BLOB") == 0 || strcmp(token, "VARBINARY") == 0)
+		return DUCKFDW_WM_BLOB;
+	return DUCKFDW_WM_VARCHAR;
+}
+
+/*
+ * Exact or ASCII-case-insensitive equality.  DuckDB folds unquoted
+ * identifiers to lowercase, so a PG attribute "MyCol" must match the
+ * DuckDB column "mycol"; the exact compare first keeps non-ASCII names
+ * working.
+ */
+static bool
+duckdb_fdw_ci_equal(const char *a, const char *b)
+{
+	size_t		len;
+
+	if (strcmp(a, b) == 0)
+		return true;
+
+	len = strlen(a);
+	if (len != strlen(b))
+		return false;
+	for (size_t k = 0; k < len; k++)
+		if (tolower((unsigned char) a[k]) != tolower((unsigned char) b[k]))
+			return false;
+	return true;
+}
+
+/*
+ * Append one non-NULL PG value into DuckDB column `j` of the appender,
+ * converting from the PG type to the mode classified for that column.
+ * When no native (type, mode) pair applies the value is serialized with
+ * the PG output function and appended as VARCHAR; the appender casts it
+ * to the column type.
+ */
+static duckdb_state
+duckdb_fdw_append_value(DuckDBFdwExecState *festate, int j, Datum val, Oid pgtyp)
+{
+	DuckFdwWriteMode mode = duckdb_fdw_classify_write_type(festate->duckcoltypes[j]);
+
+	switch (mode)
+	{
+		case DUCKFDW_WM_BOOL:
+			if (pgtyp == BOOLOID)
+				return duckdb_append_bool(festate->appender, DatumGetBool(val));
+			break;
+		case DUCKFDW_WM_INT:
+			if (pgtyp == INT2OID)
+				return duckdb_append_int64(festate->appender,
+										   (int64_t) DatumGetInt16(val));
+			if (pgtyp == INT4OID)
+				return duckdb_append_int64(festate->appender,
+										   (int64_t) DatumGetInt32(val));
+			if (pgtyp == INT8OID)
+				return duckdb_append_int64(festate->appender, DatumGetInt64(val));
+			break;
+		case DUCKFDW_WM_FLOAT:
+			if (pgtyp == FLOAT4OID)
+				return duckdb_append_float(festate->appender, DatumGetFloat4(val));
+			if (pgtyp == FLOAT8OID)
+				return duckdb_append_double(festate->appender, DatumGetFloat8(val));
+			break;
+		case DUCKFDW_WM_DATE:
+			if (pgtyp == DATEOID)
+			{
+				duckdb_date d = duckdb_date_from_pg(DatumGetDateADT(val));
+				return duckdb_append_date(festate->appender, d);
+			}
+			break;
+		case DUCKFDW_WM_TIME:
+			if (pgtyp == TIMEOID)
+			{
+				duckdb_time t;
+
+				/* both PG and DuckDB time are micros since midnight */
+				t.micros = DatumGetInt64(val);
+				return duckdb_append_time(festate->appender, t);
+			}
+			break;
+		case DUCKFDW_WM_TIMESTAMP:
+		case DUCKFDW_WM_TIMESTAMPTZ:
+			if ((mode == DUCKFDW_WM_TIMESTAMP && pgtyp == TIMESTAMPOID) ||
+				(mode == DUCKFDW_WM_TIMESTAMPTZ && pgtyp == TIMESTAMPTZOID))
+			{
+				duckdb_timestamp ts = duckdb_timestamp_from_pg(DatumGetTimestamp(val));
+				return duckdb_append_timestamp(festate->appender, ts);
+			}
+			break;
+		case DUCKFDW_WM_BLOB:
+			if (pgtyp == BYTEAOID)
+			{
+				bytea	   *b = (bytea *) DatumGetPointer(val);
+
+				return duckdb_append_blob(festate->appender, VARDATA_ANY(b),
+										  VARSIZE_ANY_EXHDR(b));
+			}
+			break;
+		default:
+			break;
+	}
+
+	/*
+	 * Fallback: serialize with the PG output function and let the
+	 * appender cast the string to the column type.  Arrays are converted
+	 * to DuckDB list-literal syntax first; when that fails the raw text
+	 * is passed through and DuckDB rejects the row if it is invalid.
+	 */
+	{
+		Oid			typoutput;
+		bool		typisvarlena;
+		char	   *outstr;
+		duckdb_state state;
+
+		getTypeOutputInfo(pgtyp, &typoutput, &typisvarlena);
+		outstr = OidOutputFunctionCall(typoutput, val);
+		if (get_element_type(pgtyp) != InvalidOid)
+		{
+			char	   *lst = duckdb_pg_array_to_duckdb_list(outstr);
+
+			if (lst)
+			{
+				state = duckdb_append_varchar(festate->appender, lst);
+				pfree(lst);
+			}
+			else
+				state = duckdb_append_varchar(festate->appender, outstr);
+		}
+		else
+			state = duckdb_append_varchar(festate->appender, outstr);
+		pfree(outstr);
+		return state;
+	}
+}
+
+/*
+ * Fetch the DuckDB-side layout of the INSERT target (DESCRIBE) and build
+ * the name-based column mapping (write_colmap, duckcolnames,
+ * duckcoltypes).  Returns false for table-function targets, where the
+ * legacy physical-order behavior is kept (the appender cannot be created
+ * for such targets either, so DuckDB rejects the INSERT as before).
+ *
+ * A PG attribute without a DuckDB counterpart (other than dropped
+ * columns) is an error: the legacy path either failed at row time or
+ * wrote the value into the wrong column, so failing early with a clear
+ * message is strictly safer.
+ */
+static bool
+duckdb_setup_write_mapping(DuckDBFdwExecState *festate, Oid relid,
+						   const char *relname)
+{
+	/*
+	 * Table-function targets (read_parquet(...) and the like, or a bare
+	 * *.parquet path that duckdb_build_relation_reference rewrites into a
+	 * read_parquet() call) are never valid INSERT targets in DuckDB.
+	 */
+	if (duckdb_fdw_is_table_function_call(festate->table_name) ||
+		strstr(festate->table_name, ".parquet") != NULL)
+		return false;
+
+	{
+		char	   *relref = duckdb_build_relation_reference(festate->table_name);
+		char	   *sql = psprintf("DESCRIBE %s", relref);
+		duckdb_result res;
+
+		if (duckdb_query_checked(festate->conn, sql, &res) == DuckDBError)
+		{
+			char	   *err = pstrdup(duckdb_result_error(&res) ?
+									   duckdb_result_error(&res) : "unknown error");
+
+			char	   *relref_copy = pstrdup(relref);
+			duckdb_destroy_result(&res);
+			pfree(relref);
+			pfree(sql);
+			elog(ERROR, "DuckDB: failed to describe target relation %s: %s",
+				 relref_copy, err);
+		}
+		pfree(sql);
+		pfree(relref);
+
+		festate->nduckcols = (int) duckdb_row_count(&res);
+		festate->duckcolnames = (char **) palloc0(sizeof(char *) *
+												   Max(1, festate->nduckcols));
+		festate->duckcoltypes = (char **) palloc0(sizeof(char *) *
+												   Max(1, festate->nduckcols));
+		for (int j = 0; j < festate->nduckcols; j++)
+		{
+			const char *cn = duckdb_value_varchar(&res, 0, (uint64_t) j);
+			const char *ct = duckdb_value_varchar(&res, 1, (uint64_t) j);
+
+			festate->duckcolnames[j] = pstrdup(cn ? cn : "");
+			festate->duckcoltypes[j] = pstrdup(ct ? ct : "");
+		}
+		duckdb_destroy_result(&res);
+
+		festate->write_colmap = (int *) palloc0(sizeof(int) *
+												Max(1, festate->tupdesc->natts));
+		for (int i = 0; i < festate->tupdesc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(festate->tupdesc, i);
+			const char *pgname;
+			int			matched = -1;
+
+			festate->write_colmap[i] = -1;
+			if (att->attisdropped)
+				continue;
+
+			/* DuckDB-side name: column_name FDW option, else the PG name */
+			{
+				List	   *columnopts = GetForeignColumnOptions(relid, i + 1);
+				ListCell   *lc;
+
+				pgname = NameStr(att->attname);
+				foreach(lc, columnopts)
+				{
+					DefElem    *def = (DefElem *) lfirst(lc);
+
+					if (strcmp(def->defname, "column_name") == 0)
+					{
+						pgname = defGetString(def);
+						break;
+					}
+				}
+			}
+
+			for (int j = 0; j < festate->nduckcols; j++)
+			{
+				if (duckdb_fdw_ci_equal(festate->duckcolnames[j], pgname))
+				{
+					matched = j;
+					break;
+				}
+			}
+			if (matched < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_COLUMN_NAME_NOT_FOUND),
+						 errmsg("column \"%s\" of foreign table \"%s\" has no matching column in DuckDB relation \"%s\"",
+								pgname, relname, festate->table_name)));
+			festate->write_colmap[i] = matched;
 		}
 	}
 
+	festate->write_name_mapped = true;
 	return true;
 }
 
@@ -267,6 +972,52 @@ duckdb_append_slot_row(DuckDBFdwExecState *festate, TupleTableSlot *slot)
 {
 	int i;
 
+	if (festate->write_name_mapped)
+	{
+		/*
+		 * Name-mapped mode (B3): fill the columns in *DuckDB* order.  Each
+		 * DuckDB column takes the value from the PG slot position that maps
+		 * onto it; a column that exists only on the DuckDB side (no PG
+		 * counterpart) receives SQL NULL, which the appender cannot skip
+		 * around.  Dropped PG columns map to -1 and are never written.
+		 */
+		int			j;
+
+		for (j = 0; j < festate->nduckcols; j++)
+		{
+			int			src = -1;
+			duckdb_state state;
+
+			for (i = 0; i < festate->tupdesc->natts; i++)
+			{
+				if (festate->write_colmap[i] == j)
+				{
+					src = i;
+					break;
+				}
+			}
+
+			if (src < 0)
+			{
+				state = duckdb_append_null(festate->appender);
+			}
+			else
+			{
+				bool			isnull;
+				Datum		val = slot_getattr(slot, src + 1, &isnull);
+
+				state = isnull ?
+					duckdb_append_null(festate->appender) :
+					duckdb_fdw_append_value(festate, j, val,
+						TupleDescAttr(festate->tupdesc, src)->atttypid);
+			}
+			if (state == DuckDBError)
+				return false;
+		}
+		return duckdb_appender_end_row(festate->appender) != DuckDBError;
+	}
+
+	/* Legacy physical-order path: table-function targets only (B3) */
 	for (i = 0; i < festate->tupdesc->natts; i++)
 	{
 		bool		isnull;
@@ -300,15 +1051,14 @@ duckdb_append_slot_row(DuckDBFdwExecState *festate, TupleTableSlot *slot)
 					break;
 				case DATEOID:
 					{
-						duckdb_date date = {DatumGetDateADT(val) + DUCKDB_EPOCH_DIFF_DAYS};
+						duckdb_date date = duckdb_date_from_pg(DatumGetDateADT(val));
 						state = duckdb_append_date(festate->appender, date);
 					}
 					break;
 				case TIMESTAMPOID:
 				case TIMESTAMPTZOID:
 					{
-						duckdb_timestamp ts;
-						ts.micros = DatumGetInt64(val) + DUCKDB_EPOCH_DIFF_MICROS;
+						duckdb_timestamp ts = duckdb_timestamp_from_pg(DatumGetTimestamp(val));
 						state = duckdb_append_timestamp(festate->appender, ts);
 					}
 					break;
@@ -321,7 +1071,24 @@ duckdb_append_slot_row(DuckDBFdwExecState *festate, TupleTableSlot *slot)
 						/* Geometry INSERT stays on this varchar path (out of scope). */
 						getTypeOutputInfo(typ, &typoutput, &typisvarlena);
 						outstr = OidOutputFunctionCall(typoutput, val);
-						state = duckdb_append_varchar(festate->appender, outstr);
+						if (get_element_type(typ) != InvalidOid)
+						{
+							/*
+							 * 数组列: PG 输出 {..}, DuckDB list 要 [..];
+							 * 转换失败(元素含引号/多维)则原样透传让 DuckDB 报错。
+							 */
+							char *lst = duckdb_pg_array_to_duckdb_list(outstr);
+
+							if (lst)
+							{
+								state = duckdb_append_varchar(festate->appender, lst);
+								pfree(lst);
+							}
+							else
+								state = duckdb_append_varchar(festate->appender, outstr);
+						}
+						else
+							state = duckdb_append_varchar(festate->appender, outstr);
 						pfree(outstr);
 					}
 					break;
@@ -351,6 +1118,57 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
      */
     ofpinfo = (DuckDBFdwRelationInfo *) outerrel->fdw_private;
     ifpinfo = (DuckDBFdwRelationInfo *) innerrel->fdw_private;
+
+    /*
+     * Only INNER joins can be pushed down.  Outer joins (LEFT/RIGHT/FULL)
+     * are NOT pushed: a nullable-side condition (e.g. the
+     * `o_comment not like ...` part of Q13's LEFT JOIN ON clause) can be
+     * attached by the planner to the nullable member's baserestrictinfo,
+     * and the member-predicate merge below moves it into the join's
+     * remote_conds, so the deparser emits it as a post-join WHERE.  That
+     * WHERE filters out the NULL rows the outer join must keep, silently
+     * dropping a result group (TPC-H Q13: 41 groups instead of the
+     * correct 42 — the c_count=0 group of 50,004 customers with no
+     * matching orders).  The reference implementation postgres_fdw runs
+     * such a join locally (verified: it plans Q13 as a local Merge Left
+     * Join over two Foreign Scans, one per side, each with its own
+     * correct WHERE).  Refusing the pushdown gives the same shape: a
+     * local join over per-member ForeignScans — always correct.
+     */
+    if (jointype != JOIN_INNER)
+    {
+        return false;
+    }
+
+    /*
+     * Refuse join pushdown when the query's GROUP BY has a non-plain-column
+     * key (an expression such as extract()/date_part()).  Such a key cannot
+     * be pushed (it is outside the deparse function whitelist), so a local
+     * GroupAggregate is left above the join ForeignScan.  That scan, however,
+     * emits the plan targetlist (the grouping target) rather than the base
+     * column inside the expression, so core setrefs fails with "variable not
+     * found in subplan target list" (TPC-H Q7/Q8/Q9; any 2-table join plus an
+     * expression GROUP BY).  A local join makes each member scan emit its full
+     * base columns, which is correct.  Joins whose group keys are all plain
+     * base columns (Q3/Q5/Q10) still push their aggregation as a single remote
+     * scan and are unaffected.
+     */
+    if (root->parse->groupClause != NIL)
+    {
+        ListCell   *gc;
+
+        foreach (gc, root->parse->groupClause)
+        {
+            SortGroupClause *sgc = lfirst_node(SortGroupClause, gc);
+            TargetEntry  *tle = get_sortgroupclause_tle(sgc,
+                                                        root->parse->targetList);
+
+            if (tle == NULL || !IsA(tle->expr, Var))
+                return false;
+            if (((Var *) tle->expr)->varattno <= 0)
+                return false;
+        }
+    }
 
     if (ofpinfo == NULL || ifpinfo == NULL)
     {
@@ -389,6 +1207,18 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
     }
 
     /*
+     * Per-table predicates attached to a member baserel (e.g.
+     * WHERE lineitem.l_shipdate > ...) are classified into that
+     * baserel's own remote_conds/local_conds by duckdbGetForeignRelSize.
+     * They are NOT part of joinrel->baserestrictinfo (the planner
+     * attaches single-table quals to the base relation, not the join).
+     * We must merge them into the join's fpinfo so the deparser emits
+     * them in the remote SQL's WHERE clause.  (Without this, the join
+     * pushdown silently dropped all per-table predicates and returned
+     * the unfiltered join row count.)
+     */
+
+    /*
      * Create a DuckDBFdwRelationInfo for the join relation.
      */
     fpinfo = (DuckDBFdwRelationInfo *) palloc0(sizeof(DuckDBFdwRelationInfo));
@@ -408,15 +1238,62 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 
     /*
      * Identify pushable join clauses.
+     *
+     * Classify into scratch lists first: duckdb_classify_conditions()
+     * clears *local_conds on entry, so classifying directly into
+     * fpinfo->local_conds here would lose every non-pushable join qual
+     * the moment the second call (baserestrictinfo, below) runs.  The
+     * preserved join-local quals are appended after that call.
      */
-    duckdb_classify_conditions(root, joinrel, ((JoinPathExtraData *) extra)->restrictlist,
-                                &fpinfo->joinclauses, &fpinfo->local_conds);
+    {
+        List       *join_local = NIL;
+        List       *join_remote = NIL;
+
+        duckdb_classify_conditions(root, joinrel,
+                                   ((JoinPathExtraData *) extra)->restrictlist,
+                                   &join_remote, &join_local);
+
+        fpinfo->joinclauses = join_remote;
+
+        /*
+         * Identify pushable other quals.  fpinfo->local_conds is NIL
+         * here (palloc0'd, and the join quals went to the scratch
+         * list), so it is correct for this call to start from scratch.
+         */
+        duckdb_classify_conditions(root, joinrel, joinrel->baserestrictinfo,
+                                    &fpinfo->remote_conds, &fpinfo->local_conds);
+
+        /*
+         * Append the non-pushable join quals saved in the scratch list.
+         * Invariant: after the member merge below, every condition that
+         * cannot be pushed down — join quals, the join's baserestrict
+         * quals, and the member baserels' baserestrict quals — must be
+         * present in fpinfo->local_conds so the leftovers are evaluated
+         * locally instead of being dropped.
+         */
+        fpinfo->local_conds = list_concat(fpinfo->local_conds, join_local);
+    }
 
     /*
-     * Identify pushable other quals.
+     * Merge the per-table predicates that were already classified on the
+     * member baserels.  The planner attaches single-table quals (e.g.
+     * WHERE lineitem.l_shipdate > ...) to each base relation, not to the
+     * join, so joinrel->baserestrictinfo does not contain them.  Without
+     * this merge the join pushdown drops them silently and returns the
+     * unfiltered join (count(*) FROM lineitem, orders WHERE
+     * l_orderkey = o_orderkey AND l_shipdate > '1995-01-01' used to return
+     * 6001215 rows instead of 3424196).  Vars in these clauses carry
+     * baserel varnos that are already part of joinrel->relids, so
+     * duckdb_is_foreign_expr_full() above validates them against the join.
      */
-    duckdb_classify_conditions(root, joinrel, joinrel->baserestrictinfo,
-                                &fpinfo->remote_conds, &fpinfo->local_conds);
+    fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+                                       ofpinfo->remote_conds);
+    fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+                                       ifpinfo->remote_conds);
+    fpinfo->local_conds = list_concat(fpinfo->local_conds,
+                                      ofpinfo->local_conds);
+    fpinfo->local_conds = list_concat(fpinfo->local_conds,
+                                      ifpinfo->local_conds);
 
     /*
      * Set up glob_cxt for checking pushability of the join relation.
@@ -476,23 +1353,16 @@ duckdbGetForeignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
         duckdb_estimate_path_cost_size(root, joinrel, fpinfo->joinclauses, NIL, NULL,
                                        &rows, NULL, &startup_cost, &total_cost);
         add_path(joinrel, (Path *)
-                 create_foreignscan_path(root, joinrel,
+                 duckdb_create_foreign_join_path(root, joinrel,
                                           joinrel->reltarget,
                                           rows,
-#if PG_VERSION_NUM >= 180000
-                                          0, /* disabled_nodes */
-#endif
                                           startup_cost,
                                           total_cost,
                                           NIL,
                                           joinrel->lateral_relids,
                                           NULL,
-#if PG_VERSION_NUM >= 170000
                                           NIL,
                                           NIL));
-#else
-                                          NIL));
-#endif
     }
 }
 
@@ -551,7 +1421,7 @@ duckdbGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntable
         MemSet(&count_res, 0, sizeof(count_res));
         initStringInfo(&count_sql);
         appendStringInfo(&count_sql, "SELECT COUNT(*) FROM %s", relation_ref);
-        if (duckdb_query(conn, count_sql.data, &count_res) == DuckDBSuccess)
+        if (duckdb_query_checked(conn, count_sql.data, &count_res) == DuckDBSuccess)
             query_ok = true;
         if (query_ok &&
             duckdb_row_count(&count_res) > 0)
@@ -579,23 +1449,219 @@ duckdbGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
     duckdb_estimate_path_cost_size(root, baserel, NIL, NIL, NULL,
                                    &rows, NULL, &startup_cost, &total_cost);
     add_path(baserel, (Path *)
-             create_foreignscan_path(root, baserel,
+             duckdb_create_foreignscan_path(root, baserel,
                                      baserel->reltarget,
                                      rows,
-#if PG_VERSION_NUM >= 180000
-                                     0,     /* disabled_nodes */
-#endif
                                      startup_cost,
                                      total_cost,
                                      NIL,   /* no pathkeys */
                                      NULL,  /* no required_outer */
                                      NULL,  /* no fdw_outerpath */
-#if PG_VERSION_NUM >= 170000
                                      NIL,   /* no fdw_restrictinfo */
                                      NIL)); /* no fdw_private */
+
+    /*
+     * Also offer a pre-sorted variant when the query's ORDER BY can be
+     * produced by DuckDB, so a plain scan doesn't force a local Sort.
+     */
+    duckdb_add_presorted_foreign_paths(root, baserel);
+}
+
+/*
+ * duckdb_pathkeys_all_foreign
+ *	True if every pathkey can be pushed down to DuckDB.  We require that the
+ *	sort follows each column type's default ordering (the type's default
+ *	btree collation, using the standard < or > comparator) and that the
+ *	equivalent expression is shippable.
+ *
+ * This mirrors postgres_fdw's is_foreign_pathkey().  Exotic operator classes
+ * and collations (e.g. text_pattern_ops, ICU collations) are deliberately not
+ * pushed down: DuckDB's collation handling does not guarantee to match
+ * Postgres, and falling back to a local Sort is always correct.
+ */
+static bool
+duckdb_pathkeys_all_foreign(PlannerInfo *root, RelOptInfo *rel, List *pathkeys)
+{
+	ListCell   *lc;
+
+	foreach(lc, pathkeys)
+	{
+		PathKey    *pathkey = (PathKey *) lfirst(lc);
+		Expr	   *em_expr;
+
+		/*
+		 * The comparator must be the type's standard < or > operator.
+		 */
+#if PG_VERSION_NUM >= 180000
+		/*
+		 * PG18 replaced the btree strategy number pk_strategy with the
+		 * CompareType pk_cmptype; COMPARE_LT / COMPARE_GT are the < and >
+		 * comparators (access/cmptype.h).
+		 */
+		if (pathkey->pk_cmptype != COMPARE_LT &&
+			pathkey->pk_cmptype != COMPARE_GT)
+			return false;
 #else
-                                     NIL)); /* no fdw_private */
+		if (pathkey->pk_strategy != BTLessStrategyNumber &&
+			pathkey->pk_strategy != BTGreaterStrategyNumber)
+			return false;
 #endif
+
+		/*
+		 * Collation safety.  DuckDB has no notion of Postgres collations and
+		 * always sorts text by its native (byte / UTF-8) ordering.  That
+		 * matches Postgres only for non-collatable types (int, float, date,
+		 * ... -- eclass collation is InvalidOid, and for collatable non-C
+		 * types the collation-less "default" which is OID 100) and for the C
+		 * collation itself.  Any other collation (locale / ICU /
+		 * text_pattern_ops) could order rows differently, so do not push the
+		 * sort down and let the planner use a local Sort instead.
+		 */
+		if (pathkey->pk_eclass->ec_collation != InvalidOid &&
+			pathkey->pk_eclass->ec_collation != DEFAULT_COLLATION_OID &&
+			pathkey->pk_eclass->ec_collation != C_COLLATION_OID)
+			return false;
+
+		/*
+		 * The EC must contain a shippable expression computed from this
+		 * relation, else DuckDB cannot evaluate the sort key.
+		 */
+		em_expr = duckdb_find_em_expr_for_rel(pathkey->pk_eclass, rel);
+		if (em_expr == NULL)
+			return false;
+		if (!duckdb_is_foreign_expr(root, rel, em_expr))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * duckdb_add_presorted_foreign_paths
+ *	For a base or join relation, add pre-sorted ForeignPaths carrying
+ *	root->query_pathkeys (which is root->sort_pathkeys at this planning
+ *	stage for a simple SELECT ... ORDER BY), when the sort order is safe to
+ *	produce remotely.  This mirrors postgres_fdw's
+ *	add_paths_with_pathkeys_for_rel(): ORDER BY is pushed down by giving a
+ *	based-path the query's pathkeys -- not by creating an ordered upper
+ *	relation path -- so GetForeignPlan keeps treating the path as an ordinary
+ *	base/join scan (SELECT list from attrs_used / join target).
+ */
+static void
+duckdb_add_presorted_foreign_paths(PlannerInfo *root, RelOptInfo *rel)
+{
+	DuckDBFdwRelationInfo *fpinfo;
+	List	   *pathkeys;
+	double		rows;
+	int			width;
+	Cost		startup_cost;
+	Cost		total_cost;
+
+	if (rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_JOINREL)
+		return;
+
+	fpinfo = (DuckDBFdwRelationInfo *) rel->fdw_private;
+	if (fpinfo == NULL || !fpinfo->pushdown_safe)
+		return;
+
+	/*
+	 * The planner will only make use of the remote sort if it can push down
+	 * all of the query's pathkeys; a prefix is not useful (see
+	 * get_useful_pathkeys_for_relation in postgres_fdw.c).
+	 */
+	pathkeys = root->query_pathkeys;
+	if (pathkeys == NIL)
+		return;
+
+	/*
+	 * A locally-filtered scan cannot be pre-sorted remotely: DuckDB would
+	 * sort rows that the local Filter is going to discard anyway (wrong
+	 * total rows below the LIMIT if any, and wasted work otherwise).
+	 */
+	if (fpinfo->local_conds != NIL)
+		return;
+
+	if (!duckdb_pathkeys_all_foreign(root, rel, pathkeys))
+		return;
+
+	duckdb_estimate_path_cost_size(root, rel, NIL, pathkeys, NULL,
+								   &rows, &width, &startup_cost, &total_cost);
+
+	if (IS_SIMPLE_REL(rel))
+	{
+		add_path(rel, (Path *)
+				 duckdb_create_foreignscan_path(root, rel,
+										  NULL, /* target: use reltarget */
+										  rows,
+										  startup_cost,
+										  total_cost,
+										  list_copy(pathkeys),
+										  rel->lateral_relids,
+										  NULL, /* no fdw_outerpath */
+										  NIL,  /* no fdw_restrictinfo */
+										  NIL)); /* no fdw_private */
+	}
+	else
+	{
+		add_path(rel, (Path *)
+				 duckdb_create_foreign_join_path(root, rel,
+										   NULL, /* target: use reltarget */
+										   rows,
+										   startup_cost,
+										   total_cost,
+										   list_copy(pathkeys),
+										   rel->lateral_relids,
+										   NULL, /* no fdw_outerpath */
+										   fpinfo->joinclauses,
+										   NIL)); /* no fdw_private */
+	}
+}
+
+/*
+ * True when tlist already contains a TargetEntry that is exactly the given
+ * (varno, varattno) Var.  Used by the B4 tlist patch-up to avoid appending
+ * a column the scan already produces.
+ */
+static bool
+duckdb_tlist_contains_var(List *tlist, int varno, int varattno)
+{
+    ListCell   *lc;
+
+    foreach(lc, tlist)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+        if (IsA(tle->expr, Var) &&
+            ((Var *) tle->expr)->varno == varno &&
+            ((Var *) tle->expr)->varattno == varattno)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Build a plan targetlist from the relation's reltarget (the columns the
+ * planner needs from this relation), mirroring core build_path_tlist()
+ * (createplan.c) for the non-parameterized case.  Used when the planner
+ * hands us a NULL targetlist (CP_IGNORE_TLIST) for a pushed-down join.
+ */
+static List *
+duckdb_build_reltarget_tlist(RelOptInfo *rel)
+{
+    List       *tlist = NIL;
+    int         resno = 1;
+    ListCell   *lc;
+
+    foreach (lc, rel->reltarget->exprs)
+    {
+        Expr       *expr = (Expr *) lfirst(lc);
+        TargetEntry *tle = makeTargetEntry(expr, resno, NULL, false);
+
+        if (rel->reltarget->sortgrouprefs)
+            tle->ressortgroupref = rel->reltarget->sortgrouprefs[resno - 1];
+        tlist = lappend(tlist, tle);
+        resno++;
+    }
+    return tlist;
 }
 
 static ForeignScan *
@@ -625,6 +1691,24 @@ duckdbGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
     {
         /* Join pushdown */
         scanrelid = 0;
+        /*
+         * The planner may hand us a NULL targetlist: when a
+         * projection-capable parent sits above the join it plans us with
+         * CP_IGNORE_TLIST (create_plan passes tlist=NULL).  A join scan
+         * (scanrelid=0) with a NULL plan targetlist breaks core setrefs —
+         * the upper node maps its columns against the scan's (empty)
+         * targetlist and fails with "variable not found in subplan target
+         * list" (TPC-H Q2: 3-table join where the projection above the
+         * pushed-down join selects a column set that makes the planner
+         * insert that projection).  Build the targetlist from the join's
+         * reltarget — exactly the columns build_path_tlist() would derive
+         * from the path, and the non-NULL fdw_scan_tlist that
+         * postgres_fdw guarantees via build_tlist_to_deparse().  Queries
+         * whose join is not under a projection get a non-NULL tlist and
+         * are unaffected.
+         */
+        if (tlist == NIL)
+            tlist = duckdb_build_reltarget_tlist(baserel);
         deparse_tlist = tlist;
         /* Use the OID of the first foreign table involved in the join as a dummy */
         rel_oid = fpinfo->server->serverid;
@@ -636,7 +1720,100 @@ duckdbGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
         deparse_tlist = duckdb_build_tlist_to_deparse(baserel);
     }
 
-    duckdb_deparse_select_stmt_for_rel(&sql, root, baserel, deparse_tlist, fpinfo->remote_conds, NIL, false, false, false, &retrieved_attrs, &params_list);
+    /*
+     * B4/M1: for a join or upper relation the plan targetlist holds only
+     * the columns the planner wants from the scan (its reltarget); the
+     * columns referenced solely by the local conditions (e.g. a join
+     * clause or HAVING condition that could not be pushed) are missing
+     * from it.  The local Filter attached to the ForeignScan would then
+     * reference Vars that setrefs cannot map to any subplan targetlist
+     * entry ("variable not found in subplan target list"), so append
+     * the missing columns as extra output columns of the scan.  They
+     * are made non-resjunk on purpose: this FDW's scan slot is built
+     * from the plan targetlist *excluding* resjunk entries, and the
+     * local Filter evaluates against that slot, so a resjunk extra
+     * column would be fetched remotely but unreadable locally (the slot
+     * position would keep its zeroed/NULL state and the filter would
+     * silently discard rows).  Upper nodes only ever reference the
+     * original resnos, so the extra resnos are simply unused.
+     *
+     * A base relation (scanrelid > 0) needs no patch-up: its scan slot
+     * is the full relation descriptor and its remote SELECT is built
+     * from attrs_used, which already includes the local-condition
+     * columns (duckdb_build_tlist_to_deparse / GetForeignPaths).
+     */
+    if ((IS_JOIN_REL(baserel) || IS_UPPER_REL(baserel)) &&
+        fpinfo->local_conds != NIL)
+    {
+        ListCell   *lc;
+        int         next_resno = 0;
+
+        foreach(lc, tlist)
+            next_resno = Max(next_resno,
+                             ((TargetEntry *) lfirst(lc))->resno);
+
+        foreach(lc, fpinfo->local_conds)
+        {
+            RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+            List       *vars = pull_var_clause((Node *) rinfo->clause,
+                                                PVC_RECURSE_PLACEHOLDERS);
+            ListCell   *vlc;
+
+            foreach(vlc, vars)
+            {
+                Var        *var = (Var *) lfirst(vlc);
+
+                if (duckdb_tlist_contains_var(tlist, var->varno,
+                                               var->varattno))
+                    continue;
+                /*
+                 * deparse_tlist aliases tlist for join/upper rels, so
+                 * the appended column is both emitted by the remote
+                 * SELECT (duckdb_deparse_explicit_target_list walks
+                 * this same list, positions and retrieved_attrs stay
+                 * in lockstep) and present in the scan slot.
+                 */
+                tlist = lappend(tlist,
+                                makeTargetEntry((Expr *) var, ++next_resno,
+                                                NULL, false));
+            }
+        }
+
+        /*
+         * lappend() on a NIL (or custom-headed) list returns a fresh
+         * list head, which would leave deparse_tlist pointing at the
+         * pre-patch list; re-alias it so the remote SELECT gains the
+         * same extra columns the plan targetlist does.
+         */
+        deparse_tlist = tlist;
+    }
+
+    {
+        /*
+         * ORDER BY / LIMIT pushdown (see duckdbGetForeignPaths and
+         * duckdbGetForeignUpperPaths) travels on the ForeignPath: the expected
+         * sort order is carried in the path's pathkeys, and the final path
+         * additionally stashes [has_final_sort, has_limit] in fdw_private.
+         * Read them back so the deparser can emit ORDER BY / LIMIT clauses.
+         * The plain base-scan path has pathkeys == NIL and no fdw_private, so
+         * this is a no-op for existing scans.
+         */
+        List   *pathkeys = best_path->path.pathkeys;
+        bool    has_final_sort = false;
+        bool    has_limit = false;
+
+        if (best_path->fdw_private != NULL &&
+            list_length(best_path->fdw_private) >= 2)
+        {
+            has_final_sort = boolVal(list_nth(best_path->fdw_private, 0));
+            has_limit = boolVal(list_nth(best_path->fdw_private, 1));
+        }
+
+        duckdb_deparse_select_stmt_for_rel(&sql, root, baserel, deparse_tlist,
+                                           fpinfo->remote_conds, pathkeys,
+                                           has_final_sort, has_limit, false,
+                                           &retrieved_attrs, &params_list);
+    }
 
     fdw_private = list_make4(makeString(sql.data),
                              retrieved_attrs,
@@ -649,12 +1826,19 @@ duckdbGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 static void
 duckdbBeginForeignScan(ForeignScanState *node, int eflags)
 {
-    DuckDBFdwExecState *festate = (DuckDBFdwExecState *)palloc0(sizeof(DuckDBFdwExecState));
+    DuckDBFdwExecState *festate = node->fdw_state;
     ForeignScan *fsplan = (ForeignScan *)node->ss.ps.plan;
     ForeignTable *table;
     Oid foreigntableid;
 
+    if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+        return;
+    if (festate)
+        MemSet(festate, 0, sizeof(*festate));
+    else
+        festate = palloc0(sizeof(*festate));
     node->fdw_state = (void *)festate;
+    duckdb_register_resource(CurrentMemoryContext, duckdb_cleanup_scan, NULL, festate);
 
     if (fsplan->scan.scanrelid > 0)
     {
@@ -682,13 +1866,53 @@ duckdbBeginForeignScan(ForeignScanState *node, int eflags)
 	if (node->ss.ps.ps_ExprContext == NULL)
 		ExecAssignExprContext(node->ss.ps.state, &node->ss.ps);
 
+	/*
+	 * Defer the remote query when the scan carries remote parameters
+	 * (fsplan->fdw_exprs != NIL, i.e. the Remote SQL uses ? placeholders).
+	 * Such a parameter is usually fed by a PARAM_EXEC that the planner
+	 * turns a non-correlated scalar subquery into an InitPlan, and the
+	 * InitPlan only runs AFTER this scan's BeginForeignScan (the whole
+	 * plan tree is initialized in ExecutorStart before any InitPlan is
+	 * executed).  Binding the parameter in Begin therefore reads a
+	 * not-yet-set slot: a numeric SubPlan param is still the Datum 0, so
+	 * the text-fallback path calls numeric_out(0) and dereferences NULL
+	 * (segfault, TPC-H Q20's "0.5 * sum(ps_availqty)").  postgres_fdw
+	 * avoids this by executing the remote query on first ExecProc, by
+	 * which time the InitPlan has run and the PARAM_EXEC slot holds its
+	 * value.  Do the same: run the query on first Iterate instead.
+	 * Scans without remote parameters (all other TPC-H queries) keep
+	 * executing here in Begin exactly as before.
+	 */
+	if (fsplan->fdw_exprs != NIL)
+	{
+		festate->query_executed = false;
+		festate->current_chunk_idx = 0;
+		festate->current_chunk_row_idx = 0;
+		festate->global_row_idx = 0;
+		festate->use_chunk_scan = false;
+		festate->current_chunk_row_count = 0;
+		festate->is_started = true;
+		return;
+	}
+
 	duckdb_execute_query(festate, node, fsplan);
 
 	festate->current_chunk_idx = 0;
 	festate->current_chunk_row_idx = 0;
 	festate->global_row_idx = 0;
 	festate->use_chunk_scan = duckdb_can_use_chunk_scan(festate->tupdesc,
-														 festate->retrieved_attrs);
+														festate->retrieved_attrs);
+	/*
+	 * The fast path assumes each vector element has the physical width of
+	 * its Postgres type.  DuckDB widens some results (e.g. sum(int) is a
+	 * 16-byte HUGEINT), so only trust the fast path when every retrieved
+	 * column's DuckDB type actually matches; otherwise fall back to the
+	 * type-correct text path.
+	 */
+	if (festate->use_chunk_scan)
+		festate->use_chunk_scan =
+			duckdb_chunk_types_ok(&festate->res, festate->tupdesc,
+								  festate->retrieved_attrs);
 	if (festate->use_chunk_scan)
 		festate->use_chunk_scan = duckdb_fetch_next_chunk(festate);
 	if (!festate->use_chunk_scan)
@@ -696,10 +1920,54 @@ duckdbBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->is_started = true;
 }
 
+static DateADT
+duckdb_date_to_pg(int32 days)
+{
+	int64		pgdays;
+
+	if (days == -PG_INT32_MAX)
+		return DATEVAL_NOBEGIN;
+	if (days == PG_INT32_MAX)
+		return DATEVAL_NOEND;
+	pgdays = (int64) days - DUCKDB_EPOCH_DIFF_DAYS;
+	if (!IS_VALID_DATE(pgdays))
+		ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						errmsg("date is out of range for PostgreSQL")));
+	return (DateADT) pgdays;
+}
+
+static Timestamp
+duckdb_timestamp_to_pg(int64 micros)
+{
+	Timestamp	ts;
+
+	if (micros == -PG_INT64_MAX)
+		return DT_NOBEGIN;
+	if (micros == PG_INT64_MAX)
+		return DT_NOEND;
+	if (pg_sub_s64_overflow(micros, DUCKDB_EPOCH_DIFF_MICROS, &ts) ||
+		!IS_VALID_TIMESTAMP(ts))
+		ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						errmsg("timestamp is out of range for PostgreSQL")));
+	return ts;
+}
+
 static Datum
-duckdb_value_to_pg(DuckDBFdwExecState *festate, int col_idx, uint64_t global_row, Oid pgtype)
+duckdb_value_to_pg(DuckDBFdwExecState *festate, int col_idx, uint64_t global_row, Oid pgtype,
+                   bool *value_missing)
 {
 	Datum		blob_datum;
+
+    /*
+     * Distinguish a genuine SQL NULL (checked by the caller via
+     * duckdb_value_is_null) from a *missing* value, i.e. the underlying
+     * duckdb_value_varchar() lookup failed.  Without the flag the caller
+     * would store a zero (NULL pointer) Datum with isnull = false and
+     * crash when the by-reference value is dereferenced; with it, the
+     * missing value is delivered as SQL NULL and the slot state
+     * (tts_values = 0, tts_isnull = true) stays self-consistent.
+     */
+    *value_missing = false;
 
 	/* GEOMETRY/BLOB: duckdb_value_blob + PostGIS geometry (see duckdb_fdw_geom.c). */
 	if (duckdb_fdw_convert_blob_column(&festate->res, col_idx, global_row,
@@ -724,21 +1992,26 @@ duckdb_value_to_pg(DuckDBFdwExecState *festate, int col_idx, uint64_t global_row
         case FLOAT8OID:
             return Float8GetDatum(duckdb_value_double(&festate->res, col_idx, global_row));
 	        case DATEOID:
-	            return Int32GetDatum(duckdb_value_date(&festate->res, col_idx, global_row).days - DUCKDB_EPOCH_DIFF_DAYS);
+	            return Int32GetDatum(duckdb_date_to_pg(duckdb_value_date(&festate->res, col_idx, global_row).days));
         case UUIDOID: {
             char *s = duckdb_value_varchar(&festate->res, col_idx, global_row);
-            if (!s) return (Datum)0;
+            if (!s) { *value_missing = true; return (Datum)0; }
             Datum res = DirectFunctionCall1(uuid_in, CStringGetDatum(s));
             duckdb_free(s);
             return res;
         }
         default: {
             char *s = duckdb_value_varchar(&festate->res, col_idx, global_row);
-            if (!s) return (Datum)0;
+            if (!s) { *value_missing = true; return (Datum)0; }
 
-            /* Handle array format conversion: DuckDB [1,2] -> PG {1,2} */
+            /*
+             * Handle array format conversion: DuckDB [1,2] -> PG {1,2}.
+             * Only for array targets; a text value like "[foo]" must be
+             * returned unchanged.
+             */
             size_t slen = strlen(s);
-            if (slen >= 2 && s[0] == '[' && s[slen-1] == ']')
+            if (get_element_type(pgtype) != InvalidOid &&
+                slen >= 2 && s[0] == '[' && s[slen-1] == ']')
             {
                 for (char *p = s; *p; p++) {
                     if (*p == '[') *p = '{';
@@ -768,7 +2041,59 @@ duckdbIterateForeignScan(ForeignScanState *node)
 	    ListCell   *lc;
 	    int         i;
 
+    /*
+     * Deferred execution for parameter-carrying scans (see
+     * duckdbBeginForeignScan): by the time the parent node first
+     * iterates us, the InitPlans feeding our remote parameters have
+     * already been executed, so binding them now reads their real values
+     * instead of the not-yet-set slots that would segfault in Begin.
+     * This also performs the result/chunk setup that the deferred Begin
+     * skipped.
+     */
+    duckdb_check_access(festate->conn);
+    if (!festate->query_executed)
+	{
+		ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+
+		duckdb_execute_query(festate, node, fsplan);
+		festate->current_chunk_idx = 0;
+		festate->current_chunk_row_idx = 0;
+		festate->global_row_idx = 0;
+		festate->use_chunk_scan = duckdb_can_use_chunk_scan(festate->tupdesc,
+				festate->retrieved_attrs);
+		if (festate->use_chunk_scan)
+			festate->use_chunk_scan =
+				duckdb_chunk_types_ok(&festate->res, festate->tupdesc,
+						festate->retrieved_attrs);
+		if (festate->use_chunk_scan)
+			festate->use_chunk_scan = duckdb_fetch_next_chunk(festate);
+		if (!festate->use_chunk_scan)
+			festate->current_chunk_row_count = duckdb_row_count(&festate->res);
+	}
+
     ExecClearTuple(slot);
+    /*
+     * Zero the slot so that EVERY attribute is in a consistent state before
+     * we fill only the retrieved ones.  ExecClearTuple does not reset
+     * tts_values[]/tts_isnull[] for a virtual slot, so non-retrieved columns
+     * would otherwise keep a stale (often zero) by-reference Datum while the
+     * tts_nvalid = natts below claims them valid.  When the ForeignScan is
+     * not the top node (e.g. a local Group/Sort sits on top and materializes
+     * the full tuple via heap_form_tuple), that stale pointer is dereferenced
+     * as VARSIZE(NULL) and segfaults.  Initializing all columns to NULL makes
+     * the slot fully consistent: retrieved columns get real values, the rest
+     * are legitimately NULL (no lower plan node needs their value).
+     */
+    {
+        int natts = slot->tts_tupleDescriptor->natts;
+        int     a;
+        for (a = 0; a < natts; a++)
+        {
+            slot->tts_values[a] = 0;
+            slot->tts_isnull[a] = true;
+        }
+    }
+
 
 	    if (festate->use_chunk_scan)
 		{
@@ -794,6 +2119,7 @@ duckdbIterateForeignScan(ForeignScanState *node)
 	            int attnum_idx = attnum_pg - 1;
 	            Oid pgtype = TupleDescAttr(festate->tupdesc, attnum_idx)->atttypid;
 				bool	isnull = false;
+				bool	value_missing = false;
 				Datum	dvalue = (Datum) 0;
 
 				if (festate->use_chunk_scan && festate->current_chunk)
@@ -828,14 +2154,14 @@ duckdbIterateForeignScan(ForeignScanState *node)
 								dvalue = Float8GetDatum(((double *) data)[row]);
 								break;
 							case DATEOID:
-								dvalue = Int32GetDatum(((duckdb_date *) data)[row].days - DUCKDB_EPOCH_DIFF_DAYS);
+								dvalue = Int32GetDatum(duckdb_date_to_pg(((duckdb_date *) data)[row].days));
 								break;
 							case TIMESTAMPOID:
 							case TIMESTAMPTZOID:
-								dvalue = Int64GetDatum(((duckdb_timestamp *) data)[row].micros - DUCKDB_EPOCH_DIFF_MICROS);
+								dvalue = Int64GetDatum(duckdb_timestamp_to_pg(((duckdb_timestamp *) data)[row].micros));
 								break;
 							default:
-								dvalue = duckdb_value_to_pg(festate, i, festate->global_row_idx, pgtype);
+								dvalue = duckdb_value_to_pg(festate, i, festate->global_row_idx, pgtype, &value_missing);
 								break;
 						}
 					}
@@ -846,8 +2172,16 @@ duckdbIterateForeignScan(ForeignScanState *node)
 				}
 				else
 				{
-					dvalue = duckdb_value_to_pg(festate, i, festate->current_chunk_row_idx, pgtype);
+					dvalue = duckdb_value_to_pg(festate, i, festate->current_chunk_row_idx, pgtype, &value_missing);
 				}
+
+				/*
+				 * A missing underlying value (duckdb_value_varchar failed) is
+				 * delivered as SQL NULL so tts_values / tts_isnull stay
+				 * consistent instead of holding a non-NULL zero pointer.
+				 */
+				if (value_missing)
+					isnull = true;
 
 				slot->tts_isnull[attnum_idx] = isnull;
 				slot->tts_values[attnum_idx] = isnull ? (Datum) 0 : dvalue;
@@ -869,26 +2203,89 @@ duckdbIterateForeignScan(ForeignScanState *node)
 }
 
 static void
+duckdb_cleanup_scan(void *arg)
+{
+	DuckDBFdwExecState *festate = arg;
+
+	if (festate->current_chunk)
+		duckdb_destroy_data_chunk(&festate->current_chunk);
+	if (festate->query_executed)
+	{
+		duckdb_destroy_result(&festate->res);
+		festate->query_executed = false;
+	}
+	if (festate->prepared_stmt)
+		duckdb_destroy_prepare(&festate->prepared_stmt);
+}
+
+static void
 duckdbEndForeignScan(ForeignScanState *node)
 {
-	    DuckDBFdwExecState *festate = (DuckDBFdwExecState *)node->fdw_state;
-	    if (festate)
-	    {
-			if (festate->current_chunk)
-				duckdb_destroy_data_chunk(&festate->current_chunk);
-	        duckdb_destroy_result(&festate->res);
-			if (festate->use_prepared_stmt && festate->prepared_stmt)
-				duckdb_destroy_prepare(&festate->prepared_stmt);
-	    }
+	if (node->fdw_state)
+		duckdb_cleanup_scan(node->fdw_state);
 }
 
 static void
 duckdbReScanForeignScan(ForeignScanState *node)
 {
 	DuckDBFdwExecState *oldstate = (DuckDBFdwExecState *)node->fdw_state;
+	if (oldstate)
+		duckdb_check_access(oldstate->conn);
 	duckdbEndForeignScan(node);
 	duckdbBeginForeignScan(node, 0);
-	pfree(oldstate);
+}
+
+/*
+ * duckdb_add_foreign_ordered_paths
+ *  Record FDW metadata on the ordered upper relation so that a downstream
+ *  FINAL relation (ORDER BY ... LIMIT) can inherit the foreign context and
+ *  the planner keeps calling our GetForeignUpperPaths for FINAL.
+ *
+ * For a base/join input relation no path is created here: the ORDER BY is
+ * already pushed down by the pre-sorted base path (carrying
+ * root->query_pathkeys).  This mirrors postgres_fdw's
+ * add_foreign_ordered_paths() early-return for base/join inputs.
+ */
+static void
+duckdb_add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
+                                 RelOptInfo *ordered_rel)
+{
+    DuckDBFdwRelationInfo *ifpinfo =
+        (DuckDBFdwRelationInfo *) input_rel->fdw_private;
+    DuckDBFdwRelationInfo *fpinfo =
+        (DuckDBFdwRelationInfo *) palloc0(sizeof(DuckDBFdwRelationInfo));
+
+    if (root->parse->hasTargetSRFs)
+    {
+        pfree(fpinfo);
+        return;
+    }
+
+    fpinfo->outerrel = input_rel;
+    fpinfo->foreigntableid = ifpinfo->foreigntableid;
+    fpinfo->server = ifpinfo->server;
+    fpinfo->user = ifpinfo->user;
+    fpinfo->stage = UPPERREL_ORDERED;
+
+    /*
+     * The ORDER BY is only pushable when every query pathkey is safe to
+     * produce remotely (see duckdb_add_presorted_foreign_paths, which
+     * creates the pre-sorted base path on exactly this condition).  Record
+     * that so the FINAL handler can tell a real remote sort from a local
+     * one and not emit an ORDER BY that DuckDB cannot honour.
+     */
+    fpinfo->pushdown_safe =
+        ifpinfo->pushdown_safe &&
+        root->query_pathkeys != NIL &&
+        duckdb_pathkeys_all_foreign(root, input_rel, root->query_pathkeys);
+
+    ordered_rel->fdw_private = fpinfo;
+
+    /*
+     * Base / join input: the ORDER BY is handled by the pre-sorted base
+     * path, so nothing more to do (the FINAL handler will unwrap back to
+     * the base relation and push the LIMIT on top of it).
+     */
 }
 
 static void
@@ -896,24 +2293,306 @@ duckdbGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
                             RelOptInfo *input_rel, RelOptInfo *output_rel,
                             void *extra)
 {
+    /*
+     * GROUPING SETS / ROLLUP / CUBE (parse->groupingSets != NIL) are not
+     * supported by the deparser: it only emits a plain GROUP BY (see
+     * Assert(!query->groupingSets) in deparse.c).  A pushdown here would
+     * silently drop the grouping-sets semantics, so bail out before any
+     * foreign path is created and let the planner handle the grouping
+     * locally.
+     */
+    if (root->parse->groupingSets != NIL)
+        return;
+
     DuckDBFdwRelationInfo *fpinfo;
 
     if (input_rel == NULL || input_rel->fdw_private == NULL ||
         !((DuckDBFdwRelationInfo *) input_rel->fdw_private)->pushdown_safe)
         return;
 
-    if (stage != UPPERREL_GROUP_AGG)
+    if (stage != UPPERREL_GROUP_AGG && stage != UPPERREL_ORDERED &&
+        stage != UPPERREL_FINAL)
+        return;
+
+    /* Skip duplicate calls. */
+    if (output_rel->fdw_private != NULL)
+        return;
+
+    if (stage == UPPERREL_ORDERED)
+    {
+        duckdb_add_foreign_ordered_paths(root, input_rel, output_rel);
+        return;
+    }
+
+    /*
+     * Only the FINAL stage is new; GROUP_AGG keeps the (HAVING-aware) path
+     * construction below, unchanged.
+     */
+    if (stage == UPPERREL_FINAL)
+    {
+        Query		*parse = root->parse;
+        FinalPathExtraData *final_extra = (FinalPathExtraData *) extra;
+        DuckDBFdwRelationInfo *ifpinfo =
+            (DuckDBFdwRelationInfo *) input_rel->fdw_private;
+        List	   *pathkeys = NIL;
+        bool		has_final_sort = false;
+        double		rows;
+        int			width;
+        Cost		startup_cost;
+        Cost		total_cost;
+        List	   *fdw_private;
+
+        /*
+         * If the input is the ORDERED upper relation (ORDER BY ... LIMIT),
+         * the ORDER BY itself has already been pushed down by the
+         * pre-sorted base path.  Unwrap back to the underlying base/join
+         * relation and push the LIMIT on top of it, re-marking the sort as
+         * a final sort.  Same design as add_foreign_final_paths() in
+         * postgres_fdw.c.
+         */
+        if (input_rel->reloptkind == RELOPT_UPPER_REL &&
+            ifpinfo->stage == UPPERREL_ORDERED)
+        {
+            input_rel = ifpinfo->outerrel;
+            ifpinfo = (DuckDBFdwRelationInfo *) input_rel->fdw_private;
+            has_final_sort = true;
+            pathkeys = list_copy(root->sort_pathkeys);
+        }
+
+        /*
+         * Currently we only push down LIMIT/OFFSET for a plain (base or
+         * join) scan.  A remote "GROUP BY ... LIMIT" (input_rel being a
+         * grouping relation) is a separate, less common case that would
+         * require re-deriving the aggregate scan's attrs_used; leave it to
+         * the planner's local Limit-over-GroupAggregate until needed.
+         */
+        if (input_rel->reloptkind != RELOPT_BASEREL &&
+            input_rel->reloptkind != RELOPT_JOINREL)
+            return;
+
+        if (parse->commandType != CMD_SELECT || parse->hasTargetSRFs)
+            return;
+
+        /* The LIMIT itself must be required and simple (no WITH TIES). */
+        if (!final_extra->limit_needed)
+            return;
+        if (parse->limitOption == LIMIT_OPTION_WITH_TIES)
+            return;
+
+        /*
+         * A locally-filtered scan cannot be LIMITed remotely: DuckDB would
+         * count rows that the local Filter discards anyway, returning a
+         * different (wrong) number of rows.
+         */
+        if (ifpinfo->local_conds != NIL)
+            return;
+
+        /* The LIMIT / OFFSET expressions must be pushable. */
+        if (parse->limitCount &&
+            !duckdb_is_foreign_expr(root, input_rel, (Expr *) parse->limitCount))
+            return;
+        if (parse->limitOffset &&
+            !duckdb_is_foreign_expr(root, input_rel, (Expr *) parse->limitOffset))
+            return;
+
+        /*
+         * If the query also has an ORDER BY, the remote scan must produce it
+         * in order; that requires every sort pathkey to be safe to ship.
+         * When it is, the final path carries the sort pathkeys and the
+         * deparser emits ORDER BY; otherwise the planner sorts locally.
+         */
+        if (root->sort_pathkeys)
+        {
+            if (!duckdb_pathkeys_all_foreign(root, input_rel,
+                                             root->sort_pathkeys))
+                return;
+            pathkeys = list_copy(root->sort_pathkeys);
+            has_final_sort = true;
+        }
+
+        /*
+         * Build the final relation's fpinfo.  The path's parent is the input
+         * (base) relation, not the final rel, so GetForeignPlan deparses it
+         * as an ordinary base scan (SELECT list from attrs_used -- which
+         * already includes the ORDER BY columns).  See
+         * add_foreign_final_paths() in postgres_fdw.c for the same design.
+         */
+        fpinfo = (DuckDBFdwRelationInfo *) palloc0(sizeof(DuckDBFdwRelationInfo));
+        fpinfo->outerrel = input_rel;
+        fpinfo->foreigntableid = ifpinfo->foreigntableid;
+        fpinfo->server = ifpinfo->server;
+        fpinfo->user = ifpinfo->user;
+        fpinfo->pushdown_safe = true;
+        output_rel->fdw_private = fpinfo;
+
+        /*
+         * Cost.  The remote engine applies the ORDER BY / LIMIT *during* the
+         * scan, so it produces and transfers only the requested window of
+         * rows.  A local Limit-over-scan instead pulls the full result set
+         * back from DuckDB and only then discards rows, so the remote final
+         * path is cheaper on the data-transfer portion.
+         *
+         * We scale the (total - startup) data portion down to the window
+         * fraction (like adjust_limit_rows_costs does for a local Limit) and
+         * then apply a small "remote early-termination" discount.  Without
+         * the discount the two paths cost exactly the same and the planner's
+         * add_path tie-break keeps the local Limit (it is added first, see
+         * grouping_planner in planner.c); the discount makes the remote
+         * LIMIT win precisely when there is a real transfer benefit, and
+         * tie (local Limit kept) when the data portion is negligible.
+         */
+        duckdb_estimate_path_cost_size(root, input_rel, NIL, pathkeys, NULL,
+                                       &rows, &width, &startup_cost, &total_cost);
+        {
+            double window_frac = 1.0;
+            Cost     full_data = total_cost - startup_cost;
+            double   new_rows;
+
+            if (final_extra->count_est > 0 && rows > 0)
+                window_frac = (double) final_extra->count_est / rows;
+            if (window_frac < 0.0)
+                window_frac = 0.0;
+            if (window_frac > 1.0)
+                window_frac = 1.0;
+
+            /* transfer only the window, at a discount for remote early-stop */
+            total_cost = startup_cost + full_data * window_frac * 0.75;
+            new_rows = final_extra->count_est > 0
+                       ? (double) final_extra->count_est
+                       : rows * window_frac;
+            if (new_rows < 1.0)
+                new_rows = 1.0;
+            rows = new_rows;
+        }
+
+        /*
+         * fdw_private for the ForeignPath: [has_final_sort, has_limit].
+         * duckdbGetForeignPlan reads these back when it deparses the query.
+         */
+        fdw_private = list_make2(makeBoolean(has_final_sort),
+                                 makeBoolean(final_extra->limit_needed));
+
+        /*
+         * create_foreign_upper_path() sets path->parent = input_rel (the
+         * base relation) even though the path is added to output_rel (the
+         * FINAL upper relation).  GetForeignPlan then deparses it as an
+         * ordinary base scan (SELECT list from attrs_used, which already
+         * includes the ORDER BY columns).  Same design as
+         * add_foreign_final_paths() in postgres_fdw.c.
+         */
+        add_path(output_rel, (Path *)
+                 duckdb_create_foreign_upper_path(root,
+                                           input_rel,
+                                           root->upper_targets[UPPERREL_FINAL],
+                                           rows,
+                                           startup_cost,
+                                           total_cost,
+                                           pathkeys,
+                                           NULL, /* no fdw_outerpath */
+                                           NIL,  /* no fdw_restrictinfo */
+                                           fdw_private));
+        return;
+    }
+
+    GroupPathExtraData *grouping_extra = (GroupPathExtraData *) extra;
+    DuckDBFdwRelationInfo *ofpinfo =
+        (DuckDBFdwRelationInfo *) input_rel->fdw_private;
+
+    /*
+     * If the underlying scan has local conditions, they must be applied
+     * before the aggregation runs; DuckDB can only evaluate a WHERE over its
+     * own scan, so an aggregation on top of a locally-filtered scan cannot
+     * be pushed as one remote query.  (Without this guard the remote
+     * GROUP BY would silently aggregate unfiltered rows.)
+     */
+    if (ofpinfo->local_conds != NIL)
         return;
 
     fpinfo = (DuckDBFdwRelationInfo *) palloc0(sizeof(DuckDBFdwRelationInfo));
     fpinfo->pushdown_safe = false;
     fpinfo->outerrel = input_rel;
-    fpinfo->foreigntableid = ((DuckDBFdwRelationInfo *) input_rel->fdw_private)->foreigntableid;
-    fpinfo->server = ((DuckDBFdwRelationInfo *) input_rel->fdw_private)->server;
-    fpinfo->user = ((DuckDBFdwRelationInfo *) input_rel->fdw_private)->user;
+    fpinfo->foreigntableid = ofpinfo->foreigntableid;
+    fpinfo->server = ofpinfo->server;
+    fpinfo->user = ofpinfo->user;
     output_rel->fdw_private = fpinfo;
 
-    if (duckdb_is_foreign_expr(root, output_rel, (Expr *) output_rel->reltarget->exprs))
+    if (!duckdb_is_foreign_expr(root, output_rel, (Expr *) output_rel->reltarget->exprs))
+        return;
+
+    /*
+     * BUG: a GROUP BY whose query carries a subquery (initplan / SubPlan)
+     * combined with aggregation pushdown can segfault the backend while
+     * executing the remote aggregate (TPC-H Q11 / Q20: a scalar-subquery
+     * HAVING plus a multiplication aggregate).  By the time this upper path
+     * is built the subquery has usually been turned into an initplan and the
+     * HAVING into a reference to its output Param, so checking the HAVING for
+     * a SubLink does not see it; the reliable signal is that the query has
+     * initplans.  Until the execution layer handles a pushed-down remote
+     * aggregate alongside an initplan, keep such aggregations local: PG's
+     * (local GroupAggregate over the ForeignScan, the initplan
+     * run separately, HAVING over the local aggregate) is correct.  Queries
+     * without subqueries (TPC-H Q3/Q10 join aggregates) are unaffected.
+     */
+    if (root->parse->hasSubLinks)
+        return;
+
+    /*
+     * Classify the HAVING quals: those evaluable remotely go to
+     * fpinfo->remote_conds (deparse emits them as the HAVING clause), the
+     * rest to fpinfo->local_conds (re-applied by the local plan).  Without
+     * this classification remote_conds stays NULL and the HAVING clause is
+     * silently dropped from the remote query, returning unfiltered groups.
+     * The core planner does not wrap HAVING quals in RestrictInfos, so we
+     * make our own.
+     */
+    if (grouping_extra->havingQual != NULL)
+    {
+        ListCell   *lc;
+
+        foreach(lc, (List *) grouping_extra->havingQual)
+        {
+            Expr       *hexpr = (Expr *) lfirst(lc);
+            RestrictInfo *rinfo;
+
+            Assert(!IsA(hexpr, RestrictInfo));
+            rinfo = duckdb_make_restrictinfo(root, hexpr, true, false, false, false,
+                                              root->qual_security_level,
+                                              output_rel->relids, NULL, NULL);
+            if (duckdb_is_foreign_expr(root, output_rel, hexpr))
+                fpinfo->remote_conds = lappend(fpinfo->remote_conds, rinfo);
+            else
+                fpinfo->local_conds = lappend(fpinfo->local_conds, rinfo);
+        }
+    }
+
+    /*
+     * Aggregates referenced by HAVING quals kept local still have to be
+     * computed remotely (the group aggregates are not available locally),
+     * so every such aggregate must be shippable.
+     */
+    if (fpinfo->local_conds != NIL)
+    {
+        List       *aggvars = NIL;
+        ListCell   *lc;
+
+        foreach(lc, fpinfo->local_conds)
+        {
+            RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+            aggvars = list_concat(aggvars,
+                                  pull_var_clause((Node *) rinfo->clause,
+                                                  PVC_INCLUDE_AGGREGATES));
+        }
+        foreach(lc, aggvars)
+        {
+            Expr       *expr = (Expr *) lfirst(lc);
+
+            if (IsA(expr, Aggref) &&
+                !duckdb_is_foreign_expr(root, output_rel, expr))
+                return;
+        }
+    }
+
     {
         double rows;
         Cost startup_cost;
@@ -923,23 +2602,15 @@ duckdbGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
         duckdb_estimate_path_cost_size(root, output_rel, NIL, NIL, NULL,
                                        &rows, NULL, &startup_cost, &total_cost);
         add_path(output_rel, (Path *)
-                 create_foreignscan_path(root, output_rel,
+                 duckdb_create_foreign_upper_path(root, output_rel,
                                           output_rel->reltarget,
                                           rows,
-#if PG_VERSION_NUM >= 180000
-                                          0, /* disabled_nodes */
-#endif
                                           startup_cost,
                                           total_cost,
                                           NIL,
                                           NULL,
-                                          NULL,
-#if PG_VERSION_NUM >= 170000
                                           NIL,
                                           NIL));
-#else
-                                          NIL));
-#endif
     }
 }
 
@@ -951,7 +2622,17 @@ duckdbIsForeignRelUpdatable(Relation rel)
 	 * SQL fallback path. UPDATE and DELETE are not supported — the
 	 * planner will skip FDW modify paths for those operations rather
 	 * than failing at execution time.
+	 *
+	 * Servers created with force_readonly reject all DML at plan time.
 	 */
+	ForeignTable *ftable;
+
+	if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		ftable = GetForeignTable(rel->rd_id);
+		if (duckdb_fdw_server_is_readonly(GetForeignServer(ftable->serverid)))
+			return 0;
+	}
 	return (1 << CMD_INSERT);
 }
 
@@ -972,31 +2653,66 @@ duckdbPlanForeignModify(PlannerInfo *root, ModifyTable *plan, Index resultRelati
 static void
 duckdbBeginForeignModify(ModifyTableState *mtstate, ResultRelInfo *resultRelInfo, List *fdw_private, int subplan_index, int eflags)
 {
-	    DuckDBFdwExecState *festate = (DuckDBFdwExecState *)palloc0(sizeof(DuckDBFdwExecState));
-	    Relation rel = resultRelInfo->ri_RelationDesc;
-	    duckdb_opt *options = duckdb_get_options(RelationGetRelid(rel));
-		duckdb_state state;
-	    festate->conn = duckdb_get_connection(GetForeignServer(GetForeignTable(RelationGetRelid(rel))->serverid), false);
+    MemoryContext query_cxt = mtstate ? mtstate->ps.state->es_query_cxt : CurrentMemoryContext;
+    DuckDBFdwExecState *festate = MemoryContextAllocZero(query_cxt, sizeof(*festate));
+    Relation rel = resultRelInfo->ri_RelationDesc;
+    duckdb_opt *options = duckdb_get_options(RelationGetRelid(rel));
+
+    if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+        return;
+    resultRelInfo->ri_FdwState = festate;
+    duckdb_register_resource(query_cxt, duckdb_cleanup_modify, duckdb_finish_modify, festate);
+    festate->conn = duckdb_get_connection(GetForeignServer(GetForeignTable(RelationGetRelid(rel))->serverid), false);
+    duckdb_ensure_remote_xact(festate->conn);
     festate->table_name = options->svr_table;
     festate->tupdesc = RelationGetDescr(rel);
-	festate->use_appender = false;
-    /* options->svr_table points into persistent catalog memory — safe to free the wrapper */
     pfree(options);
-	state = duckdb_appender_create(festate->conn, NULL, festate->table_name, &festate->appender);
-		if (state == DuckDBSuccess)
-			festate->use_appender = true;
-	    resultRelInfo->ri_FdwState = (void *)festate;
+
+    if (duckdb_appender_create(festate->conn, NULL, festate->table_name, &festate->appender) == DuckDBSuccess)
+        festate->use_appender = true;
+    else
+    {
+        /* SQL INSERT also supports targets the Appender cannot resolve. */
+        if (festate->appender)
+            duckdb_appender_destroy(&festate->appender);
+        festate->appender = NULL;
+    }
+
+    /* Appender and SQL INSERT share the remote column-name mapping. */
+    if (festate->table_name != NULL)
+    {
+        char *relname = pstrdup(RelationGetRelationName(rel));
+
+        duckdb_setup_write_mapping(festate, RelationGetRelid(rel), relname);
+        pfree(relname);
+    }
+}
+
+static void
+duckdbBeginForeignInsert(ModifyTableState *mtstate, ResultRelInfo *resultRelInfo)
+{
+    /*
+     * COPY FROM and partition routing enter through BeginForeignInsert
+     * instead of BeginForeignModify (mtstate is NULL for a directly
+     * invoked COPY).  duckdbBeginForeignModify only consults
+     * resultRelInfo->ri_RelationDesc -- the mtstate/fdw_private/
+     * subplan_index/eflags arguments are unused -- so the pass-through is
+     * NULL-safe and sets up exactly the same write state.
+     */
+    duckdbBeginForeignModify(mtstate, resultRelInfo, NULL, 0, 0);
 }
 
 static TupleTableSlot *
 duckdbExecForeignInsert(EState *executor, ResultRelInfo *resultRelInfo, TupleTableSlot *slot, TupleTableSlot *planSlot)
 {
 	    DuckDBFdwExecState *festate = (DuckDBFdwExecState *)resultRelInfo->ri_FdwState;
+		duckdb_check_access(festate->conn);
 		if (festate->use_appender)
 		{
 			if (!duckdb_append_slot_row(festate, slot))
 			{
 				const char *err = duckdb_appender_error(festate->appender);
+				duckdb_mark_xact_failed(festate->conn);
 				elog(ERROR, "DuckDB appender insert failed: %s", err ? err : "unknown appender error");
 			}
 			return slot;
@@ -1007,16 +2723,40 @@ duckdbExecForeignInsert(EState *executor, ResultRelInfo *resultRelInfo, TupleTab
 			StringInfoData sql;
 			int i;
 			char *relref = duckdb_build_relation_reference(festate->table_name);
+			bool firstcol = true;
+			bool firstval = true;
 
 			initStringInfo(&sql);
-			appendStringInfo(&sql, "INSERT INTO %s VALUES (", relref);
+			appendStringInfo(&sql, "INSERT INTO %s ", relref);
+			if (festate->write_name_mapped)
+			{
+				/* B3: explicit column list (DuckDB-side names, same order as the
+				 * VALUES list below); columns without a PG counterpart are not
+				 * written at all.  Without a name mapping (table-function target)
+				 * keep the legacy physical-order statement. */
+				appendStringInfoString(&sql, "(");
+				for (i = 0; i < festate->tupdesc->natts; i++)
+				{
+					if (festate->write_colmap[i] < 0)
+						continue;
+					if (!firstcol) appendStringInfoString(&sql, ", ");
+					firstcol = false;
+					appendStringInfoString(&sql,
+						duckdb_fdw_quote_identifier(festate->duckcolnames[festate->write_colmap[i]]));
+				}
+				appendStringInfoString(&sql, ") ");
+			}
+			appendStringInfoString(&sql, "VALUES (");
 			pfree(relref);
 
 			for (i = 0; i < festate->tupdesc->natts; i++)
 			{
 				bool isnull;
 				Datum val = slot_getattr(slot, i + 1, &isnull);
-				if (i > 0) appendStringInfoString(&sql, ", ");
+				if (festate->write_name_mapped && festate->write_colmap[i] < 0)
+					continue;
+				if (!firstval) appendStringInfoString(&sql, ", ");
+				firstval = false;
 				if (isnull) appendStringInfoString(&sql, "NULL");
 				else {
 					Oid typ = TupleDescAttr(festate->tupdesc, i)->atttypid;
@@ -1036,8 +2776,13 @@ duckdbExecForeignInsert(EState *executor, ResultRelInfo *resultRelInfo, TupleTab
 
 			{
 				duckdb_result res;
-				if (duckdb_query(festate->conn, sql.data, &res) == DuckDBError)
-					elog(ERROR, "DuckDB insert failed: %s", duckdb_result_error(&res));
+				if (duckdb_query_checked(festate->conn, sql.data, &res) == DuckDBError)
+				{
+					/* error text is owned by the result: copy before destroy */
+					const char *errtxt = pstrdup(duckdb_result_error(&res));
+					duckdb_destroy_result(&res);
+					elog(ERROR, "DuckDB insert failed: %s", errtxt);
+				}
 				duckdb_destroy_result(&res);
 			}
 			pfree(sql.data);
@@ -1066,6 +2811,28 @@ duckdbGetForeignModifyBatchSize(ResultRelInfo *rinfo)
 {
 	DuckDBFdwExecState *festate = (DuckDBFdwExecState *) rinfo->ri_FdwState;
 
+	/*
+	 * Disable batching when we have to use RETURNING, there are any
+	 * BEFORE/AFTER ROW INSERT triggers on the foreign table, or there are any
+	 * WITH CHECK OPTION constraints from parent views.
+	 *
+	 * The executor projects RETURNING and bumps the command-tag counter only
+	 * on the per-row (ri_BatchSize == 1) path.  If we advertise a batch size
+	 * greater than 1 while a RETURNING clause is present, the insert is
+	 * diverted into the batch-accumulation path in nodeModifyTable.c, where a
+	 * single row never reaches the 2048-row flush threshold: ExecForeignInsert
+	 * is therefore never called, RETURNING projects no rows and the tag reports
+	 * "INSERT 0 0" even though the row is eventually flushed at shutdown.  This
+	 * mirrors postgres_fdw's postgresGetForeignModifyBatchSize(), which returns
+	 * 1 in the same situations.
+	 */
+	if (rinfo->ri_projectReturning != NULL ||
+		rinfo->ri_WithCheckOptions != NIL ||
+		(rinfo->ri_TrigDesc &&
+		 (rinfo->ri_TrigDesc->trig_insert_before_row ||
+		  rinfo->ri_TrigDesc->trig_insert_after_row)))
+		return 1;
+
 	if (festate && festate->use_appender)
 		return 2048;
 	return 1;
@@ -1086,21 +2853,73 @@ duckdbExecForeignDelete(EState *executor, ResultRelInfo *resultRelInfo, TupleTab
 }
 
 static void
-duckdbEndForeignModify(EState *executor, ResultRelInfo *resultRelInfo)
+duckdb_cleanup_modify(void *arg)
 {
-	DuckDBFdwExecState *festate = (DuckDBFdwExecState *) resultRelInfo->ri_FdwState;
+    DuckDBFdwExecState *festate = arg;
 
-	if (!festate)
-		return;
-	if (festate->use_appender && festate->appender)
+    if (festate->appender)
+    {
+        duckdb_state cleared = duckdb_appender_clear(festate->appender);
+        duckdb_state destroyed = duckdb_appender_destroy(&festate->appender);
+
+        if (cleared == DuckDBError || destroyed == DuckDBError)
+            duckdb_mark_xact_failed(festate->conn);
+    }
+}
+
+static void
+duckdb_finish_modify(void *arg)
+{
+	DuckDBFdwExecState *festate = arg;
+
+	if (festate->appender)
 	{
 		duckdb_state close_state = duckdb_appender_close(festate->appender);
-		duckdb_appender_destroy(&festate->appender);
+		char *message = NULL;
+		duckdb_state destroy_state;
+
 		if (close_state == DuckDBError)
-			ereport(WARNING,
-					(errmsg("duckdb_fdw: appender close reported an error"),
-					 errdetail("Some buffered rows may not have been flushed to DuckDB.")));
+		{
+			const char *error = duckdb_appender_error(festate->appender);
+
+			if (error)
+				message = duckdb_fdw_redact_secret_text(error);
+		}
+		destroy_state = duckdb_appender_destroy(&festate->appender);
+		if (close_state == DuckDBError || destroy_state == DuckDBError)
+		{
+			duckdb_mark_xact_failed(festate->conn);
+			if (message)
+				ereport(ERROR, (errcode(ERRCODE_FDW_ERROR),
+								errmsg("could not insert into DuckDB table"),
+								errdetail("%s", message)));
+			ereport(ERROR, (errcode(ERRCODE_FDW_ERROR),
+							errmsg("could not insert into DuckDB table")));
+		}
 	}
+}
+
+static void
+duckdbEndForeignModify(EState *executor, ResultRelInfo *resultRelInfo)
+{
+	DuckDBFdwExecState *festate = resultRelInfo->ri_FdwState;
+
+	if (festate)
+	{
+		duckdb_finish_modify(festate);
+		duckdb_cleanup_modify(festate);
+	}
+}
+
+static void
+duckdbEndForeignInsert(EState *estate, ResultRelInfo *resultRelInfo)
+{
+    /*
+     * COPY FROM / partition routing: flush whatever duckdbEndForeignModify
+     * would flush (it only touches resultRelInfo->ri_FdwState, so the
+     * pass-through is valid even with a NULL estate on direct COPY).
+     */
+    duckdbEndForeignModify(estate, resultRelInfo);
 }
 
 static void
@@ -1133,12 +2952,14 @@ Datum duckdb_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->AddForeignUpdateTargets = duckdbAddForeignUpdateTargets;
 	    fdwroutine->PlanForeignModify = duckdbPlanForeignModify;
 	    fdwroutine->BeginForeignModify = duckdbBeginForeignModify;
+	    fdwroutine->BeginForeignInsert = duckdbBeginForeignInsert;
 	    fdwroutine->ExecForeignInsert = duckdbExecForeignInsert;
 		fdwroutine->ExecForeignBatchInsert = duckdbExecForeignBatchInsert;
 		fdwroutine->GetForeignModifyBatchSize = duckdbGetForeignModifyBatchSize;
 	    fdwroutine->ExecForeignUpdate = duckdbExecForeignUpdate;
 	    fdwroutine->ExecForeignDelete = duckdbExecForeignDelete;
 	    fdwroutine->EndForeignModify = duckdbEndForeignModify;
+	    fdwroutine->EndForeignInsert = duckdbEndForeignInsert;
 
     PG_RETURN_POINTER(fdwroutine);
 }
@@ -1325,8 +3146,33 @@ PG_FUNCTION_INFO_V1(duckdb_execute);
 Datum duckdb_execute(PG_FUNCTION_ARGS) {
     char *servername = NameStr(*PG_GETARG_NAME(0));
     char *query = text_to_cstring(PG_GETARG_TEXT_PP(1));
-    duckdb_connection conn = duckdb_get_connection(GetForeignServerByName(servername, false), false);
-    duckdb_do_sql_command(conn, query, LOG);
+    ForeignServer *server = GetForeignServerByName(servername, false);
+
+    /*
+     * force_readonly servers reject anything but conservative read-only
+     * statements through the generic escape hatch as well.  File-backed
+     * databases additionally cannot be written because DuckDB itself
+     * opens them READ_ONLY; this gate also covers :memory: databases.
+     */
+    if (duckdb_fdw_server_is_readonly(server) &&
+        !duckdb_fdw_sql_is_readonly(query))
+        elog(ERROR, "duckdb_fdw: statement rejected on force_readonly server %s",
+             servername);
+
+    /*
+     * Run the statement and surface any DuckDB error to the caller.
+     * duckdb_do_sql_command() reports at the given elog level; passing ERROR
+     * (not LOG) is what makes a failed DDL/DML raise here instead of being
+     * logged server-side while the client still sees success.  Without this
+     * a mistyped statement (e.g. a CTAS with an explicit column definition,
+     * which DuckDB rejects) silently no-ops and the caller cannot tell.
+     */
+    duckdb_connection conn = duckdb_get_connection(server, false);
+    if (duckdb_remote_xact_active(conn))
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                       errmsg("cannot call duckdb_execute after a DuckDB table write has started in the same transaction"),
+                       errhint("Commit or roll back the transaction before calling duckdb_execute.")));
+    duckdb_do_sql_command(conn, query, ERROR);
     PG_RETURN_VOID();
 }
 
@@ -1374,13 +3220,20 @@ Datum duckdb_create_s3_secret(PG_FUNCTION_ARGS) {
 int
 duckdb_set_transmission_modes(void)
 {
+    int         nestlevel;
+
     /* For now, just return 0 */
-    return 0;
+    nestlevel = NewGUCNestLevel();
+    (void) set_config_option("DateStyle", "ISO, YMD",
+                             PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_SAVE, true, 0, false);
+    return nestlevel;
 }
 
 void
 duckdb_reset_transmission_modes(int nestlevel)
 {
+    AtEOXact_GUC(false, nestlevel);
 }
 
 Expr *
@@ -1468,6 +3321,27 @@ _PG_init(void)
 		PGC_SUSET,
 		0,
 		duckdb_fdw_check_unsupported_pg_duckdb_coexistence,
+		NULL,
+		NULL);
+
+	DefineCustomBoolVariable(
+		"duckdb_fdw.keep_connection",
+		"Retain cached DuckDB connections across transaction commits.",
+		"Off (default): the connection cache is torn down at every top-level "
+		"transaction end.  On: after COMMIT the cached connections are kept "
+		"(the remote transaction has been settled and in_xact cleared), so the "
+		"next transaction reuses them instead of re-opening the database, "
+		"re-installing extensions and re-ATTACHing catalogs; on ABORT the "
+		"cache is still torn down after the remote ROLLBACK.  Trade-off: a "
+		"retained connection to a file-backed DuckDB database keeps the file "
+		"write lock held across transactions, so enable it per session where "
+		"reuse wins over exclusive lock holding — the gain is largest in "
+		"quack/remote mode.",
+		&duckdb_fdw_keep_connection,
+		false,
+		PGC_USERSET,
+		0,
+		NULL,
 		NULL,
 		NULL);
 

@@ -130,6 +130,7 @@ CORE_TEST_FILES=(
     "examples/16_aggregate_pushdown.sql"
     "examples/17_join_pushdown_test.sql"
     "examples/18_high_performance_v2.sql"
+    "examples/19_text_bracket_roundtrip.sql"
     "examples/19_ducklake_quack.sql"
 )
 

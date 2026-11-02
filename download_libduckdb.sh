@@ -1,4 +1,13 @@
 #!/bin/bash
+#
+# download_libduckdb.sh — fetch the prebuilt libduckdb matching this platform.
+#
+# Fail hard on any error: the previous "curl + unzip and hope" behaviour let
+# a 404 (e.g. a wrong asset name) download GitHub's HTML error page, which
+# only exploded later at `make` time with "duckdb.h: No such file or
+# directory".  set -euo pipefail + curl --fail + a post-download check make
+# the failure point the download step itself.
+
 set -euo pipefail
 
 DEFAULT_DUCKDB_VERSION="1.5.5"
@@ -26,8 +35,10 @@ get_system_info() {
                 "x86_64")
                     ARCH="amd64"
                     ;;
-                # DuckDB liberleases used "aarch64" through v1.2.x and
-                # "arm64" from v1.3.0 onward. Prefer arm64 for current pins.
+                # DuckDB names the Linux ARM64 asset "arm64" (NOT
+                # "aarch64"): .../libduckdb-linux-arm64.zip.  The
+                # aarch64 name 404s and silently breaks the build on
+                # ubuntu-*-arm runners. Prefer arm64 for current pins.
                 "aarch64"|"arm64")
                     ARCH="arm64"
                     ;;
@@ -51,27 +62,47 @@ get_system_info
 REQUESTED_VERSION=${DUCKDB_VERSION:-$DEFAULT_DUCKDB_VERSION}
 VERSION=$(normalize_version_tag "$REQUESTED_VERSION")
 
+# DuckDB 2.0+ changed its release asset naming: instead of
+# libduckdb-${PLATFORM}-${ARCH}.zip it ships duckdb-shared-libs-${PLATFORM}-${ARCH}
+# .tar.gz (the PLATFORM/ARCH suffixes are unchanged, e.g. linux-amd64,
+# osx-universal, windows-amd64).  Detect the major version and pick the
+# matching asset base name + archive format.
+MAJOR="${REQUESTED_VERSION#v}"
+MAJOR="${MAJOR%%.*}"
+
+if [ "$MAJOR" -ge 2 ] 2>/dev/null; then
+    ASSET_BASE="duckdb-shared-libs"
+    ASSET_EXT="tar.gz"
+    EXTRACT="tar xzf"
+else
+    ASSET_BASE="libduckdb"
+    ASSET_EXT="zip"
+    EXTRACT="unzip -o"
+fi
+
 try_download() {
     local url="$1"
+    local file="$2"
     echo "Downloading DuckDB ${VERSION} for ${PLATFORM}-${ARCH}..."
     echo "URL: ${url}"
-    if ! curl -fsSL -o duckdb-temp.zip "${url}"; then
-        rm -f duckdb-temp.zip
+    if ! curl --fail -L --retry 3 -o "$file" "${url}"; then
+        rm -f "$file"
         return 1
     fi
-    unzip -o duckdb-temp.zip
-    rm -f duckdb-temp.zip
+    $EXTRACT "$file"
+    rm -f "$file"
     return 0
 }
 
-DOWNLOAD_URL="https://github.com/duckdb/duckdb/releases/download/${VERSION}/libduckdb-${PLATFORM}-${ARCH}.zip"
+DOWNLOAD_URL="https://github.com/duckdb/duckdb/releases/download/${VERSION}/${ASSET_BASE}-${PLATFORM}-${ARCH}.${ASSET_EXT}"
+DOWNLOAD_FILE="duckdb-temp.${ASSET_EXT}"
 
-if ! try_download "${DOWNLOAD_URL}"; then
-    if [ "${PLATFORM}" = "linux" ] && [ "${ARCH}" = "arm64" ]; then
+if ! try_download "${DOWNLOAD_URL}" "${DOWNLOAD_FILE}"; then
+    if [ "${PLATFORM}" = "linux" ] && [ "${ARCH}" = "arm64" ] && [ "$MAJOR" -lt 2 ] 2>/dev/null; then
         ARCH="aarch64"
         FALLBACK_URL="https://github.com/duckdb/duckdb/releases/download/${VERSION}/libduckdb-${PLATFORM}-${ARCH}.zip"
         echo "Primary URL failed; retrying with legacy arch name aarch64..."
-        if ! try_download "${FALLBACK_URL}"; then
+        if ! try_download "${FALLBACK_URL}" "duckdb-temp.zip"; then
             echo "Failed to download libduckdb for linux arm (tried arm64 and aarch64)" >&2
             exit 1
         fi
@@ -82,9 +113,17 @@ if ! try_download "${DOWNLOAD_URL}"; then
 fi
 
 if [ ! -f duckdb.h ]; then
-    echo "download_libduckdb.sh: duckdb.h missing after extract" >&2
-    ls -la >&2 || true
+    echo "ERROR: download did not produce duckdb.h — is ${DOWNLOAD_URL} valid?" >&2
+    echo "       (404 assets yield an HTML page; check the asset name for ${PLATFORM}-${ARCH})" >&2
     exit 1
 fi
+case "${PLATFORM}-${ARCH}" in
+    osx-universal)
+        [ -f libduckdb.dylib ] || { echo "ERROR: libduckdb.dylib missing after download" >&2; exit 1; }
+        ;;
+    *)
+        [ -f "libduckdb.${LIB_EXT}" ] || { echo "ERROR: libduckdb.${LIB_EXT} missing after download" >&2; exit 1; }
+        ;;
+esac
 
-echo "DuckDB ${VERSION} ready (libduckdb.${LIB_EXT}, duckdb.h present)."
+echo "Downloaded DuckDB ${VERSION}: duckdb.h + libduckdb.${LIB_EXT}"

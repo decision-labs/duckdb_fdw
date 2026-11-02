@@ -1,5 +1,6 @@
 #include "postgres.h"
 #include "duckdb_fdw.h"
+#include "commands/defrem.h"
 
 #include <ctype.h>
 
@@ -76,6 +77,96 @@ duckdb_fdw_is_valid_identifier(const char *input)
 	return true;
 }
 
+/*
+ * duckdb_fdw_is_table_function_call
+ *		True when `input` is a *balanced* table-function call: a valid
+ *		identifier followed by '(' and at least one string-literal argument,
+ *		with all parens closed and no statement separators.  Used by the
+ *		deparser to decide whether a `table` option already spells a remote
+ *		table function (e.g. read_json / read_csv_auto / read_parquet) and
+ *		can be passed through verbatim instead of being treated as a
+ *		qualified relation name (which would reject the path's dots/parens
+ *		as "unsafe characters").  Strictly additive: a non-matching input
+ *		falls through to the existing relation-name handling unchanged.
+ */
+bool
+duckdb_fdw_is_table_function_call(const char *input)
+{
+	const char *p;
+	const char *open;
+	int			depth = 0;
+	bool			in_str = false;
+
+	if (!input || input[0] == '\0')
+		return false;
+
+	p = input;
+	if (!(isalpha((unsigned char) p[0]) || p[0] == '_'))
+		return false;
+	while (isalnum((unsigned char) p[0]) || p[0] == '_')
+		p++;
+
+	/* skip any single-space padding before '(' */
+	while (*p == ' ' || *p == '\t')
+		p++;
+
+	if (*p != '(')
+		return false;
+
+	/* require at least one string-literal argument (a path) inside */
+	open = p;
+	for (; *open; open++)
+	{
+		if (*open == ')' || *open == ';')
+			return false;		/* closed or chained before any literal */
+		if (*open == '\'')
+			break;				/* found a literal argument */
+	}
+	if (*open != '\'')
+		return false;
+
+	/* walk the whole fragment checking paren balance and a clean close.
+	 * Path characters (slashes, dots, dashes) are fine OUTSIDE strings too;
+	 * only statement separators, identifier quotes and comment sequences
+	 * (outside string literals) disqualify. */
+	p = input;
+	while (*p)
+	{
+		if (in_str)
+		{
+			if (*p == '\'')
+			{
+				if (p[1] == '\'')
+					p++;			/* escaped quote */
+				else
+					in_str = false;
+			}
+			p++;
+			continue;
+		}
+		if (*p == '\'')
+		{
+			in_str = true;
+			p++;
+			continue;
+		}
+		if (*p == ';' || *p == '"')
+			return false;
+		if ((*p == '/' && p[1] == '*') || (*p == '-' && p[1] == '-'))
+			return false;		/* comment outside string literal */
+		if (*p == '(')
+			depth++;
+		else if (*p == ')')
+		{
+			depth--;
+			if (depth < 0)
+				return false;
+		}
+		p++;
+	}
+	return !in_str && depth == 0;
+}
+
 bool
 duckdb_fdw_is_safe_sql_fragment(const char *input)
 {
@@ -91,10 +182,39 @@ duckdb_fdw_is_safe_sql_fragment(const char *input)
 		if (*p < 32 && *p != '\t' && *p != '\n' && *p != '\r')
 			return false;
 	}
-	if (strstr(input, "--") != NULL)
-		return false;
-	if (strstr(input, "/*") != NULL || strstr(input, "*/") != NULL)
-		return false;
+	/*
+	 * Comment sequences only matter outside string literals: DuckDB globs in
+	 * table options (e.g. a parquet path with wildcard stars) legitimately
+	 * contain an asterisk and a slash-asterisk inside quotes, so a plain
+	 * strstr for those sequences produced false positives (issue #72). Walk
+	 * the fragment tracking single- and double-quoted string state and reject
+	 * a block or line comment only when it appears outside a quoted string.
+	 */
+	for (p = (const unsigned char *) input; *p; p++)
+	{
+		if (*p == '\'' || *p == '"')
+		{
+			char		q = *p;
+
+			/* skip to the closing quote; '' or "" is an escaped quote */
+			while (*++p)
+			{
+				if (*p == q)
+				{
+					if (p[1] == q)
+						p++;
+					else
+						break;
+				}
+			}
+			if (*p == '\0')
+				return false;	/* unterminated string literal */
+		}
+		else if (*p == '/' && p[1] == '*')
+			return false;	/* block comment */
+		else if (*p == '-' && p[1] == '-')
+			return false;	/* line comment */
+	}
 	return true;
 }
 
@@ -147,4 +267,103 @@ duckdb_fdw_next_token(char *str, const char *delim, char **saveptr)
 #else
 	return strtok_r(str, delim, saveptr);
 #endif
+}
+
+/*
+ * Returns true when the foreign server was created with
+ * force_readonly = true. Server-level option, checked directly from the
+ * catalog (no foreign table involved).
+ */
+bool
+duckdb_fdw_server_is_readonly(ForeignServer *server)
+{
+	ListCell   *lc;
+
+	if (!server || !server->options)
+		return false;
+
+	foreach(lc, server->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "force_readonly") == 0 &&
+			defGetBoolean(def))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Conservative read-only classifier for duckdb_execute on force_readonly
+ * servers. Only statements that cannot possibly modify DuckDB state are
+ * accepted; everything else is rejected. This intentionally errs on the
+ * side of refusal: a statement that is hard to classify is treated as a
+ * write.
+ *
+ * Allowed first keywords: SELECT, FROM, WITH, VALUES, DESCRIBE, DESC,
+ * SHOW, EXPLAIN, PRAGMA (query pragmas only; see below).
+ */
+bool
+duckdb_fdw_sql_is_readonly(const char *sql)
+{
+	static const struct
+	{
+		const char *keyword;
+		int			len;
+	} readonly_kw[] = {
+		{"SELECT", 6},
+		{"FROM", 4},
+		{"WITH", 4},
+		{"VALUES", 6},
+		{"DESCRIBE", 8},
+		{"DESC", 4},
+		{"SHOW", 4},
+		{"EXPLAIN", 7},
+	};
+	const char *p;
+	size_t		i;
+
+	if (!sql)
+		return false;
+
+	/* Skip leading whitespace and comments */
+	for (p = sql; *p; p++)
+	{
+		if (*p == '/' && p[1] == '*')
+		{
+			/* block comment: skip to closing */
+			p += 2;
+			while (*p && !(*p == '*' && p[1] == '/'))
+				p++;
+			if (*p == '\0')
+				return false;	/* unterminated comment */
+			continue;
+		}
+		if (*p == '-' && p[1] == '-')
+		{
+			/* line comment: skip to end of line */
+			p += 2;
+			while (*p && *p != '\n')
+				p++;
+			continue;
+		}
+		if (!isspace((unsigned char) *p))
+			break;
+	}
+
+	/* Statement chaining is never allowed on read-only servers */
+	for (i = (size_t) (p - sql); i < strlen(sql); i++)
+		if (sql[i] == ';')
+			return false;
+
+	for (i = 0; i < lengthof(readonly_kw); i++)
+	{
+		if ((size_t) strlen(p) >= readonly_kw[i].len &&
+			pg_strncasecmp(p, readonly_kw[i].keyword, readonly_kw[i].len) == 0 &&
+			(p[readonly_kw[i].len] == '\0' ||
+			 isspace((unsigned char) p[readonly_kw[i].len])))
+			return true;
+	}
+
+	return false;
 }

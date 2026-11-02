@@ -97,7 +97,7 @@ duckdb_fdw_geometry_type_oid(bool retry_miss)
 	return duckdb_fdw_geometry_oid;
 }
 
-static bool
+bool
 duckdb_fdw_oid_is_geometry(Oid pgtype)
 {
 	HeapTuple	tup;
