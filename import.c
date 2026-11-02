@@ -74,6 +74,7 @@ duckdb_import_foreign_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
     bool is_file = false;
     const char *catalog_prefix = "";
     char *ducklake_prefix = NULL;
+    bool is_quack = false;
     bool is_ducklake_quack = false;
     const char *ducklake_alias = "my_ducklake";
 
@@ -87,6 +88,7 @@ duckdb_import_foreign_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
             if (strcmp(def->defname, "quack_host") == 0)
             {
                 catalog_prefix = "remote.";
+                is_quack = true;
             }
             else if (strcmp(def->defname, "ducklake_quack_host") == 0)
                 is_ducklake_quack = true;
