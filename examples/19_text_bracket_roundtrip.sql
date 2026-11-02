@@ -9,11 +9,11 @@
 -- The DO block self-verifies both directions and RAISEs on any mismatch;
 -- this suite runs with ON_ERROR_STOP=1, so a regression fails CI.
 
+CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS duckdb_fdw;
 
 DROP SERVER IF EXISTS tb_srv CASCADE;
-CREATE SERVER tb_srv FOREIGN DATA WRAPPER duckdb_fdw
-  OPTIONS (database '/tmp/duckdb_fdw_text_bracket.db');
+CREATE SERVER tb_srv FOREIGN DATA WRAPPER duckdb_fdw OPTIONS (database '/tmp/duckdb_fdw_text_bracket.db');
 
 -- id, a real DuckDB list, and a text value that LOOKS like a list
 SELECT duckdb_execute('tb_srv', 'CREATE OR REPLACE TABLE tb (id INTEGER, a INTEGER[], s VARCHAR)');
