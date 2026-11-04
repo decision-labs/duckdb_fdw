@@ -1,6 +1,7 @@
 -- 18 High Performance v2.0 Test
 -- This script tests Arrow chunking (2048 rows) and Batch Appender performance
 
+CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS duckdb_fdw;
 
 CREATE SERVER perf_srv FOREIGN DATA WRAPPER duckdb_fdw OPTIONS (database '/tmp/duckdb_fdw_perf_v2.db');

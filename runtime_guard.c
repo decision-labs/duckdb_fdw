@@ -116,10 +116,13 @@ duckdb_runtime_guard_status(void)
 	return duckdb_runtime_guard_status_linux();
 #else
 	/*
-	 * Peer-module scanning is Linux-only today. On other platforms we cannot
-	 * detect a loaded pg_duckdb peer, so treat the backend as having no peer
-	 * rather than COMPATIBLE_UNPROVEN (which is a hard error under the
-	 * strict coexistence policy and breaks macOS CI).
+	 * The dl_iterate_phdr-based peer-module scan is Linux-only. On
+	 * macOS (and other platforms) we cannot prove the runtime state,
+	 * but "unproven" must not mean "rejected": without pg_duckdb in
+	 * the picture the FDW links its own libduckdb and there is no
+	 * known coexistence hazard, so treat non-Linux as the normal
+	 * "no peer loaded" path. The strict policy still applies where
+	 * it can actually be evaluated (Linux).
 	 */
 	return DUCKDB_RUNTIME_NO_PEER_LOADED;
 #endif

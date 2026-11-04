@@ -3,7 +3,6 @@
 
 #include "postgres.h"
 #include "duckdb.h"
-#include "nanoarrow/nanoarrow.h"
 #include "funcapi.h"
 #include "fmgr.h"
 #include "foreign/foreign.h"
@@ -19,6 +18,7 @@ typedef struct duckdb_opt
 	char	   *svr_database;
 	char	   *svr_table;
     bool        use_remote_estimate;
+    bool        force_readonly;
 } duckdb_opt;
 
 typedef struct DuckDBFdwRelationInfo
@@ -60,6 +60,12 @@ typedef struct DuckDBFdwRelationInfo
     List       *grouped_tlist;
     bool        is_tlist_func_pushdown;
     List       *final_remote_exprs;
+    /*
+     * Upper-relation stage this fpinfo belongs to.  Set for the grouped
+     * relation created by GetForeignUpperPaths; the deparser uses it to
+     * decide how to build the SELECT list (explicit tlist vs. grouped_tlist).
+     */
+    UpperRelationKind stage;
 } DuckDBFdwRelationInfo;
 
 typedef struct DuckDBFdwExecState
@@ -71,7 +77,6 @@ typedef struct DuckDBFdwExecState
     idx_t current_chunk_idx;
     int64_t     global_row_idx;
     bool        use_chunk_scan;
-    bool        use_prepared_stmt;
     duckdb_prepared_statement prepared_stmt;
 
 	char	   *query;
@@ -85,36 +90,78 @@ typedef struct DuckDBFdwExecState
     int64_t     current_chunk_row_idx;
     int64_t     current_chunk_row_count;
     bool        is_started;
+    bool        query_executed;	/* false until the remote query has actually run (deferred for param-carrying scans) */
 
     /* Appender state */
     duckdb_appender appender;
     int64_t     batch_row_count;
     char       *table_name;
     bool        use_appender;
+
+    /*
+     * B3: name-based column mapping for the INSERT path.  write_colmap[i]
+     * is the index of the DuckDB column that receives the value of PG
+     * tuple position i (-1: dropped column / no DuckDB counterpart).  The
+     * DuckDB side layout (names + types, in DuckDB column order) is kept
+     * in duckcolnames/duckcoltypes; the appender must fill columns in
+     * DuckDB order, which is why the DuckDB layout is stored here.  All
+     * fields stay NULL/0 until duckdb_fetch_write_schema() has run; a
+     * table-function target keeps the legacy physical-order behavior.
+     */
+    bool        write_name_mapped;
+    int         nduckcols;
+    int        *write_colmap;
+    char      **duckcolnames;
+    char      **duckcoltypes;
 } DuckDBFdwExecState;
 
 /* Exported functions */
-extern Datum duckdb_fdw_handler(PG_FUNCTION_ARGS);
-extern Datum duckdb_fdw_validator(PG_FUNCTION_ARGS);
-extern Datum duckdb_fdw_version(PG_FUNCTION_ARGS);
-extern Datum duckdb_fdw_runtime_compatibility_status(PG_FUNCTION_ARGS);
-extern Datum duckdb_fdw_runtime_fingerprint(PG_FUNCTION_ARGS);
-extern Datum duckdb_fdw_preflight(PG_FUNCTION_ARGS);
-extern Datum duckdb_execute(PG_FUNCTION_ARGS);
-extern Datum duckdb_create_s3_secret(PG_FUNCTION_ARGS);
+/*
+ * SQL-callable entry points. PGDLLEXPORT must match the declaration that
+ * PG_FUNCTION_INFO_V1 emits, otherwise MSVC rejects the redeclaration
+ * (C2375) and the symbols are not exported from duckdb_fdw.dll.
+ */
+extern PGDLLEXPORT Datum duckdb_fdw_handler(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum duckdb_fdw_validator(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum duckdb_fdw_version(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum duckdb_fdw_runtime_compatibility_status(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum duckdb_fdw_runtime_fingerprint(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum duckdb_fdw_preflight(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum duckdb_execute(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum duckdb_create_s3_secret(PG_FUNCTION_ARGS);
 extern List *duckdb_import_foreign_schema(ImportForeignSchemaStmt *stmt, Oid serverOid);
 extern duckdb_opt * duckdb_get_options(Oid foreigntableid);
 extern char *duckdb_fdw_quote_literal(const char *input);
 extern char *duckdb_fdw_quote_identifier(const char *input);
 extern bool duckdb_fdw_is_valid_identifier(const char *input);
+extern bool duckdb_fdw_is_table_function_call(const char *input);
 extern bool duckdb_fdw_is_safe_sql_fragment(const char *input);
 extern char *duckdb_fdw_redact_secret_text(const char *input);
 extern char *duckdb_fdw_trim_token(char *token);
 extern char *duckdb_fdw_next_token(char *str, const char *delim, char **saveptr);
+extern bool duckdb_fdw_server_is_readonly(ForeignServer *server);
+extern bool duckdb_fdw_sql_is_readonly(const char *sql);
+
+/*
+ * Physical layout contract between deparser (which decides whether the
+ * remote SELECT emits a bare column) and the chunk fast path (which
+ * reads the vector with a fixed stride).  Keep in sync with
+ * duckdb_chunk_types_ok()'s runtime DuckDB-type check.
+ */
+extern bool duckdb_pg_type_native_chunk(Oid pgtype);   /* PG类型可走原生定宽 */
 
 /* Internal functions */
 extern void duckdb_do_sql_command(duckdb_connection conn, const char *sql, int level);
 extern duckdb_connection duckdb_get_connection(ForeignServer *server, bool truncatable);
+extern void duckdb_ensure_remote_xact(duckdb_connection conn);
+
+extern void duckdb_check_access(duckdb_connection conn);
+extern void duckdb_mark_xact_failed(duckdb_connection conn);
+extern bool duckdb_remote_xact_active(duckdb_connection conn);
+extern void duckdb_register_resource(MemoryContext context, void (*cleanup)(void *), void (*finish)(void *), void *arg);
+extern duckdb_state duckdb_query_checked(duckdb_connection conn, const char *sql, duckdb_result *res);
+extern duckdb_state duckdb_prepare_checked(duckdb_connection conn, const char *sql, duckdb_prepared_statement *stmt);
+extern duckdb_state duckdb_execute_checked(duckdb_connection conn, duckdb_prepared_statement stmt, duckdb_result *res);
 
 /* Helper to get cleaned C-String for BuildTupleFromCStrings */
 extern char *duckdb_extract_as_cstring(duckdb_result *res, int col, uint64_t row, Oid pgtyp);

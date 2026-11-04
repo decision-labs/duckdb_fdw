@@ -1,4 +1,5 @@
 -- 09 DuckLake Import
+CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS duckdb_fdw;
 
 CREATE SERVER ducklake_import_srv FOREIGN DATA WRAPPER duckdb_fdw OPTIONS (

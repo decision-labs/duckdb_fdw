@@ -1,6 +1,7 @@
 -- 17 Join Pushdown Test
 -- This example tests if joins between two DuckDB foreign tables are pushed down.
 
+CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS duckdb_fdw;
 
 -- 1. Setup Server

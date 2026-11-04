@@ -1,5 +1,10 @@
 # duckdb FDW
 comment = 'DuckDB Foreign Data Wrapper (Native C API)'
-default_version = '2.0.1'
+default_version = '2.0.2'
 module_pathname = '$libdir/duckdb_fdw'
 relocatable = true
+# Geobase fork: PostGIS is required. The geometry type lives in postgis.so,
+# not liblwgeom — do not add -llwgeom. Postgres's CREATE EXTENSION error is
+# generic; duckdb_fdw_geom.c adds an install hint if geometry/ST_GeomFromWKB
+# is still missing at IMPORT or scan time.
+requires = 'postgis'

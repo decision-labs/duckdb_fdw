@@ -8,13 +8,15 @@
 #--------------------------------------------------------------------------
 
 MODULE_big = duckdb_fdw
-OBJS = connection.o option.o deparse.o duckdb_fdw.o nanoarrow.o import.o sql_utils.o runtime_guard.o
+# nanoarrow.c is vendored upstream but not linked (no call sites).
+# duckdb_fdw_geom.o is the Geobase PostGIS mapping (keep isolated).
+OBJS = connection.o option.o deparse.o duckdb_fdw.o import.o sql_utils.o runtime_guard.o duckdb_fdw_geom.o
 
 EXTENSION = duckdb_fdw
 DATA = $(wildcard duckdb_fdw--*.sql)
 
 # 默认回归测试
-REGRESS = duckdb_fdw
+REGRESS = duckdb_fdw duckdb_transaction
 
 # 操作系统检测
 ifeq '$(findstring ;,$(PATH))' ';'
